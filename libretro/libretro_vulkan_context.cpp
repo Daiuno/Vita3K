@@ -96,14 +96,8 @@ void try_init_renderer() {
         LOG_INFO("[Vita3K] renderer->set_app post-context_reset");
     }
 
-    // Deferring run_app from retro_load_game: start the guest only after the
-    // Vulkan device and renderer exist so retro_run can always drain GXM.
-    if (!vita3k_libretro::start_guest_if_pending(emuenv)) {
-        LOG_ERROR("[Vita3K] Deferred guest start failed; HW context stays not ready");
-        return;
-    }
-
     g_is_ready.store(true, std::memory_order_release);
+    LOG_INFO("[Vita3K] Vulkan renderer is ready; deferred guest start will run from retro_run");
 }
 
 void release_renderer() {

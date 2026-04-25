@@ -168,7 +168,7 @@ bool launch_title(EmuEnvState &emuenv, const std::string &title_id) {
     // M12.7.9: mirror main.cpp:503 -- bind the renderer's shader cache /
     // shader log paths to this title when the renderer already exists.
     // Otherwise libretro_vulkan_context::try_init_renderer calls set_app
-    // after Vulkan comes up, then start_guest_if_pending runs run_app.
+    // after Vulkan comes up, then retro_run consumes the pending run_app.
     if (emuenv.renderer && !emuenv.io.title_id.empty() && !emuenv.self_name.empty()) {
         emuenv.renderer->set_app(emuenv.io.title_id.c_str(), emuenv.self_name.c_str());
         LOG_INFO("[Vita3K] renderer->set_app('{}','{}') bound shader cache paths",
@@ -192,6 +192,7 @@ bool start_guest_if_pending(EmuEnvState &emuenv) {
         main_module_id = *g_pending_main_module_id;
     }
 
+    LOG_INFO("[Vita3K] Deferred run_app starting for module id {}", main_module_id);
     if (run_app(emuenv, main_module_id) != Success) {
         LOG_ERROR("[Vita3K] Deferred run_app failed for module id {}", main_module_id);
         {
@@ -210,6 +211,10 @@ bool start_guest_if_pending(EmuEnvState &emuenv) {
     g_title_running.store(true, std::memory_order_release);
     LOG_INFO("[Vita3K] Deferred run_app completed; guest is running");
     return true;
+}
+
+bool has_pending_guest_start() {
+    return has_pending_launch();
 }
 
 bool is_title_running() {

@@ -11,11 +11,11 @@
 // and fill the same EmuEnvState::io/app_info fields `load_app_impl()`
 // expects.  Everything after that (kernel init, module loading, guest
 // main thread creation, vblank sync thread) is reused verbatim via
-// `load_app()` immediately, and defers `run_app()` until the libretro
-// frontend has created the Vulkan device (RETRO_HW_CONTEXT_RESET →
-// libretro_vulkan_context::try_init_renderer).  This matches the libretro
-// contract: hardware resources are only used after the HW context exists,
-// so GXM batches are never queued while `process_batches` cannot run.
+// `load_app()` immediately, and defers `run_app()` until retro_run sees that
+// the libretro frontend has created the Vulkan device
+// (RETRO_HW_CONTEXT_RESET -> libretro_vulkan_context::try_init_renderer).
+// This matches the libretro contract: hardware resources are only used after
+// the HW context exists, and heavy guest work is kept out of context_reset.
 //
 // Called from retro_load_game when the content path starts with
 // VITA3K_LIBRETRO_URI_SCHEME ("vita3k://").
@@ -34,13 +34,18 @@ namespace vita3k_libretro {
 // true on success; on failure the caller should forward
 // retro_vita_last_error() to the frontend.  Loads modules via `load_app`;
 // `run_app` (guest main thread) is deferred until `start_guest_if_pending`
-// runs inside the Vulkan context_reset path.
+// runs from retro_run after the Vulkan context is ready.
 bool launch_title(EmuEnvState &emuenv, const std::string &title_id);
 
 // Runs the deferred `run_app` when `load_app` succeeded but the guest has
 // not started yet.  Idempotent — safe to call every frame.  Returns false
 // if `run_app` fails (caller should not treat the HW context as usable).
 bool start_guest_if_pending(EmuEnvState &emuenv);
+
+// True after load_app succeeded but before the deferred run_app has been
+// consumed by retro_run.  Used only for diagnostics / frontend ordering
+// checks.
+bool has_pending_guest_start();
 
 // True once `start_guest_if_pending` has completed successfully and a guest
 // main thread is live.  retro_run() gates frame work on this flag.

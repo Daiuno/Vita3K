@@ -21,20 +21,29 @@
 #include "libretro_boot.h"
 #include "libretro_game_boot.h"
 #include <config/state.h>
+#include <dialog/state.h>
+#include <display/state.h>
 #include <emuenv/state.h>
+#include <gxm/state.h>
+#include <kernel/state.h>
 #include <renderer/functions.h>
 #include <renderer/state.h>
 #include <renderer/types.h>
 #include <renderer/vulkan/libretro_vulkan_api.h>
 #include <util/fs.h>
+#include <util/string_utils.h>
 #include <util/types.h>
 
+#include <SDL3/SDL_timer.h>
+
+#include <algorithm>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
 
 // ---------------------------------------------------------------------------
@@ -87,6 +96,203 @@ namespace {
 // `extern std::unique_ptr<EmuEnvState> g_emuenv;` without going through
 // an accessor.
 std::unique_ptr<EmuEnvState> g_emuenv;
+
+namespace {
+
+const char *dialog_type_name(DialogType type) {
+    switch (type) {
+    case NO_DIALOG: return "none";
+    case IME_DIALOG: return "ime";
+    case MESSAGE_DIALOG: return "message";
+    case TROPHY_SETUP_DIALOG: return "trophy";
+    case SAVEDATA_DIALOG: return "savedata";
+    case NETCHECK_DIALOG: return "netcheck";
+    }
+    return "unknown";
+}
+
+template <typename QueueT>
+size_t queue_size_locked(QueueT &queue) {
+    const std::lock_guard<std::mutex> lk(queue.get_mutex());
+    return queue.size();
+}
+
+size_t kernel_thread_count(KernelState &kernel) {
+    const std::lock_guard<std::mutex> lk(kernel.mutex);
+    return kernel.threads.size();
+}
+
+uint32_t choose_message_button(const MsgState &msg) {
+    for (uint8_t i = 0; i < msg.btn_num; ++i) {
+        const uint32_t id = msg.btn_val[i];
+        if (id == SCE_MSG_DIALOG_BUTTON_ID_OK || id == SCE_MSG_DIALOG_BUTTON_ID_YES
+            || id == SCE_MSG_DIALOG_BUTTON_ID_BUTTON1) {
+            return id;
+        }
+    }
+    return msg.btn_num ? msg.btn_val[0] : SCE_MSG_DIALOG_BUTTON_ID_INVALID;
+}
+
+uint32_t choose_savedata_button(const SavedataState &savedata) {
+    for (uint8_t i = 0; i < savedata.btn_num; ++i) {
+        const uint32_t id = savedata.btn_val[i];
+        if (id == SCE_SAVEDATA_DIALOG_BUTTON_ID_OK)
+            return id;
+    }
+
+    if (savedata.display_type != SCE_SAVEDATA_DIALOG_TYPE_DELETE) {
+        for (uint8_t i = 0; i < savedata.btn_num; ++i) {
+            if (savedata.btn_val[i] == SCE_SAVEDATA_DIALOG_BUTTON_ID_YES)
+                return savedata.btn_val[i];
+        }
+    }
+
+    return savedata.btn_num ? savedata.btn_val[0] : SCE_SAVEDATA_DIALOG_BUTTON_ID_INVALID;
+}
+
+uint32_t choose_savedata_slot(const SavedataState &savedata, bool &ok) {
+    ok = false;
+    if (savedata.slot_list_size == 0 || savedata.slot_id.empty())
+        return 0;
+
+    const uint32_t max_index = std::min<uint32_t>(
+        std::min<uint32_t>(savedata.slot_list_size, static_cast<uint32_t>(savedata.slot_id.size())),
+        static_cast<uint32_t>(savedata.slot_info.size()));
+    if (max_index == 0)
+        return 0;
+
+    if (savedata.display_type == SCE_SAVEDATA_DIALOG_TYPE_LOAD
+        || savedata.display_type == SCE_SAVEDATA_DIALOG_TYPE_DELETE) {
+        for (uint32_t i = 0; i < max_index; ++i) {
+            if (savedata.slot_info[i].isExist == 1) {
+                ok = true;
+                return i;
+            }
+        }
+        return 0;
+    }
+
+    ok = true;
+    return std::min<uint32_t>(savedata.selected_save, max_index - 1);
+}
+
+void finish_ime_dialog(DialogState &dialog) {
+    ImeState &ime = dialog.ime;
+    if (ime.result) {
+        const std::u16string result16 = string_utils::utf8_to_utf16(ime.text);
+        const size_t capacity = static_cast<size_t>(ime.max_length) + 1;
+        const size_t copy_len = capacity ? std::min(result16.size(), capacity - 1) : 0;
+        for (size_t i = 0; i < copy_len; ++i)
+            ime.result[i] = static_cast<uint16_t>(result16[i]);
+        if (capacity)
+            ime.result[copy_len] = 0;
+    }
+
+    ime.status = SCE_IME_DIALOG_BUTTON_ENTER;
+    dialog.status = SCE_COMMON_DIALOG_STATUS_FINISHED;
+    dialog.result = SCE_COMMON_DIALOG_RESULT_OK;
+    VLOG(RETRO_LOG_INFO, "[VITA3K-LR] headless common dialog: auto-submitted IME text\n");
+}
+
+void advance_headless_common_dialogs(EmuEnvState &emuenv) {
+    DialogState &dialog = emuenv.common_dialog;
+    if (dialog.status != SCE_COMMON_DIALOG_STATUS_RUNNING)
+        return;
+
+    switch (dialog.type) {
+    case IME_DIALOG:
+        finish_ime_dialog(dialog);
+        break;
+
+    case MESSAGE_DIALOG:
+        if (!dialog.msg.has_progress_bar && dialog.msg.btn_num > 0) {
+            dialog.msg.status = choose_message_button(dialog.msg);
+            dialog.result = SCE_COMMON_DIALOG_RESULT_OK;
+            dialog.status = SCE_COMMON_DIALOG_STATUS_FINISHED;
+            VLOG(RETRO_LOG_INFO,
+                 "[VITA3K-LR] headless common dialog: auto-closed message button=%u\n",
+                 dialog.msg.status);
+        }
+        break;
+
+    case TROPHY_SETUP_DIALOG:
+        if (static_cast<int64_t>(SDL_GetTicks()) >= static_cast<int64_t>(dialog.trophy.tick)) {
+            dialog.status = SCE_COMMON_DIALOG_STATUS_FINISHED;
+            dialog.result = SCE_COMMON_DIALOG_RESULT_OK;
+            VLOG(RETRO_LOG_INFO, "[VITA3K-LR] headless common dialog: trophy setup finished\n");
+        }
+        break;
+
+    case SAVEDATA_DIALOG:
+        if (dialog.substatus != SCE_COMMON_DIALOG_STATUS_RUNNING)
+            break;
+
+        if (dialog.savedata.mode_to_display == SCE_SAVEDATA_DIALOG_MODE_LIST) {
+            bool ok = false;
+            const uint32_t slot_index = choose_savedata_slot(dialog.savedata, ok);
+            if (ok) {
+                dialog.savedata.selected_save = slot_index;
+                dialog.savedata.button_id = SCE_SAVEDATA_DIALOG_BUTTON_ID_INVALID;
+                dialog.result = SCE_COMMON_DIALOG_RESULT_OK;
+            } else {
+                dialog.savedata.button_id = SCE_SAVEDATA_DIALOG_BUTTON_ID_INVALID;
+                dialog.result = SCE_COMMON_DIALOG_RESULT_USER_CANCELED;
+            }
+            dialog.savedata.mode_to_display = SCE_SAVEDATA_DIALOG_MODE_FIXED;
+            dialog.substatus = SCE_COMMON_DIALOG_STATUS_FINISHED;
+            VLOG(RETRO_LOG_INFO,
+                 "[VITA3K-LR] headless common dialog: auto-selected savedata slot=%u ok=%d\n",
+                 slot_index, ok ? 1 : 0);
+        } else if (dialog.savedata.mode_to_display == SCE_SAVEDATA_DIALOG_MODE_FIXED
+                   && !dialog.savedata.has_progress_bar
+                   && dialog.savedata.btn_num > 0) {
+            dialog.savedata.button_id = choose_savedata_button(dialog.savedata);
+            dialog.result = SCE_COMMON_DIALOG_RESULT_OK;
+            dialog.substatus = SCE_COMMON_DIALOG_STATUS_FINISHED;
+            VLOG(RETRO_LOG_INFO,
+                 "[VITA3K-LR] headless common dialog: auto-closed savedata button=%u\n",
+                 dialog.savedata.button_id);
+        }
+        break;
+
+    default:
+        break;
+    }
+}
+
+void log_runtime_state(uint64_t host_frame, const char *phase, int sd_before = -1, int sd_after = -1) {
+    if (!log_cb || !g_emuenv)
+        return;
+
+    EmuEnvState &emuenv = *g_emuenv;
+    const size_t cmdq_depth = emuenv.renderer ? queue_size_locked(emuenv.renderer->command_buffer_queue) : 0;
+    const size_t displayq_depth = queue_size_locked(emuenv.gxm.display_queue);
+    const size_t threads = kernel_thread_count(emuenv.kernel);
+    const DialogState &dialog = emuenv.common_dialog;
+
+    VLOG(RETRO_LOG_INFO,
+         "[VITA3K-LR] runtime frame=%llu phase=%s loaded=%d pending=%d running=%d ctx=%d ready=%d renderer=%d guest_frame=%llu threads=%zu cmdq=%zu displayq=%zu vblank=%llu dialog=%s status=%d sub=%d sd=%d/%d\n",
+         static_cast<unsigned long long>(host_frame),
+         phase ? phase : "unknown",
+         g_game_loaded ? 1 : 0,
+         vita3k_libretro::has_pending_guest_start() ? 1 : 0,
+         vita3k_libretro::is_title_running() ? 1 : 0,
+         libretro_vulkan_has_context() ? 1 : 0,
+         libretro_vulkan_is_ready() ? 1 : 0,
+         emuenv.renderer ? 1 : 0,
+         static_cast<unsigned long long>(emuenv.frame_count),
+         threads,
+         cmdq_depth,
+         displayq_depth,
+         static_cast<unsigned long long>(emuenv.display.vblank_count.load()),
+         dialog_type_name(dialog.type),
+         static_cast<int>(dialog.status),
+         static_cast<int>(dialog.substatus),
+         sd_before,
+         sd_after);
+}
+
+} // namespace
 
 static void set_last_error(const char *msg) {
     g_last_error = msg ? msg : "";
@@ -288,6 +494,9 @@ RETRO_API void retro_reset(void) {
 }
 
 RETRO_API void retro_run(void) {
+    static uint64_t retro_run_count = 0;
+    ++retro_run_count;
+
     // M11.1: cheap option-update probe.  When the frontend signals a
     // change we re-snapshot every OPT_*; only a small subset (audio
     // volume, resolution multiplier, surface_sync) is honored mid-run
@@ -311,6 +520,9 @@ RETRO_API void retro_run(void) {
     // eventloop) and the bridge used by ctrl.cpp::retrieve_ctrl_data.
     libretro_input_poll();
 
+    if (g_emuenv)
+        advance_headless_common_dialogs(*g_emuenv);
+
     // Drive one guest frame.
     //
     // Vita3K is inherently multithreaded — the Vita kernel runs guest
@@ -330,17 +542,15 @@ RETRO_API void retro_run(void) {
     // case so any samples the engine produced before the HW context came
     // up do not pile up in the ring buffer.
     if (!libretro_vulkan_is_ready()) {
+        if ((retro_run_count % 60ULL) == 1ULL)
+            log_runtime_state(retro_run_count, libretro_vulkan_has_context()
+                ? "waiting-for-vulkan-ready"
+                : "waiting-for-vulkan-context");
         if (video_cb) video_cb(NULL, 0, 0, 0);
         libretro_audio_drain();
         return;
     }
 
-    // Idempotent: if the frontend signalled HW ready before we could run the
-    // deferred run_app from launch_title, complete guest start here (libretro
-    // docs: do not rely on ordering between threads; this covers edge cases).
-    if (g_emuenv && g_emuenv->renderer) {
-        vita3k_libretro::start_guest_if_pending(*g_emuenv);
-    }
     {
         static bool hw_iface_registered = false;
         if (!hw_iface_registered && env_cb) {
@@ -352,6 +562,14 @@ RETRO_API void retro_run(void) {
                 hw_iface_registered = true;
             }
         }
+    }
+
+    // Idempotent: once the frontend has supplied the Vulkan interface and
+    // renderer, consume the deferred run_app from launch_title.  Keeping this
+    // on retro_run avoids doing heavy guest work inside context_reset.
+    if (g_emuenv && g_emuenv->renderer) {
+        if (!vita3k_libretro::start_guest_if_pending(*g_emuenv))
+            log_runtime_state(retro_run_count, "guest-start-failed");
     }
 
     constexpr unsigned kVitaWidth  = 960;
@@ -384,27 +602,13 @@ RETRO_API void retro_run(void) {
                                          g_emuenv->mem);
         g_emuenv->renderer->swap_window(nullptr);
 
-        // Throttled diagnostics – use a local counter that counts retro_run
-        // calls rather than emuenv.frame_count (which the guest increments
-        // inside _sceDisplaySetFrameBuf).  That way we still see diagnostics
-        // during loading when the guest hasn't produced a frame yet.
-        {
-            static uint64_t retro_run_count = 0;
-            ++retro_run_count;
-            if ((retro_run_count % 60ULL) == 1ULL && log_cb) {
-                const uint32_t q_depth = g_emuenv->renderer
-                    ? static_cast<uint32_t>(g_emuenv->renderer->command_buffer_queue.size())
-                    : 0;
-                log_cb(RETRO_LOG_INFO,
-                    "[VITA3K-LR] retro_run host_frame=%llu guest_frame=%llu sd_before=%d sd_after=%d ctx=%s cmdq=%u\n",
-                    (unsigned long long)retro_run_count,
-                    (unsigned long long)g_emuenv->frame_count,
-                    sd_before ? 1 : 0,
-                    sd_after ? 1 : 0,
-                    (g_emuenv->renderer && g_emuenv->renderer->context ? "set" : "null"),
-                    q_depth);
-            }
-        }
+        // Throttled diagnostics use retro_run_count rather than
+        // emuenv.frame_count so we still see loading stalls before the guest
+        // submits its first display frame.
+        if ((retro_run_count % 60ULL) == 1ULL)
+            log_runtime_state(retro_run_count, "running", sd_before ? 1 : 0, sd_after ? 1 : 0);
+    } else if ((retro_run_count % 60ULL) == 1ULL) {
+        log_runtime_state(retro_run_count, "ready-no-title");
     }
 
     if (video_cb)
