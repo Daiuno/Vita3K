@@ -19,6 +19,10 @@
 
 #include "vkutil/vkutil.h"
 
+#ifdef LIBRETRO
+#include <vkutil/vma_libretro.h>
+#endif
+
 #include <util/align.h>
 #include <util/log.h>
 
@@ -78,6 +82,15 @@ Image::~Image() {
 }
 
 void Image::init_image(vk::ImageUsageFlags usage, vk::ComponentMapping mapping, const vk::ImageCreateFlags image_create_flags, const void *pNext) {
+#ifdef LIBRETRO
+    {
+        const vk::PhysicalDevice phys = allocator.getAllocatorInfo().physicalDevice;
+        const uint32_t max_dim = phys.getProperties().limits.maxImageDimension2D;
+        width = vkutil::clamp_image_extent_component(width, max_dim);
+        height = vkutil::clamp_image_extent_component(height, max_dim);
+        vkutil::clamp_image_extent_to_block_grid(width, height, format, max_dim);
+    }
+#endif
     vk::ImageCreateInfo image_info{
         .pNext = pNext,
         .flags = image_create_flags,
@@ -96,7 +109,14 @@ void Image::init_image(vk::ImageUsageFlags usage, vk::ComponentMapping mapping, 
         .initialLayout = vk::ImageLayout::eUndefined,
     };
 
+#ifdef LIBRETRO
+    {
+        const uint32_t seq = vkutil::next_vkutil_vma_seq();
+        vkutil::libretro_vma_create_image(allocator, image_info, "vkutil::Image::init_image", seq, image, allocation, nullptr);
+    }
+#else
     std::tie(image, allocation) = allocator.createImage(image_info, vma_auto_alloc);
+#endif
 
     // only create a view if one of these flags is set
     constexpr vk::ImageUsageFlags view_usages = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eDepthStencilAttachment | vk::ImageUsageFlagBits::eStorage;

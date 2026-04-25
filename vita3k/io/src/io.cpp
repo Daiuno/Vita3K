@@ -798,8 +798,15 @@ int create_dir(IOState &io, const char *dir, int mode, const fs::path &pref_path
     }
 
     const auto emulated_path = device::construct_emulated_path(device, translated_path, pref_path, io.redirect_stdio);
-    if (recursive)
-        return fs::create_directories(emulated_path);
+    if (recursive) {
+        boost::system::error_code ec;
+        fs::create_directories(emulated_path, ec);
+        if (ec) {
+            LOG_ERROR("Failed to create directories at {} (target path: {}): {}", emulated_path, dir, ec.message());
+            return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
+        }
+        return 0;
+    }
     if (fs::exists(emulated_path))
         return IO_ERROR(SCE_ERROR_ERRNO_EEXIST);
 

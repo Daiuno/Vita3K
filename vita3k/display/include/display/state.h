@@ -46,6 +46,10 @@ struct DisplayFrameInfo {
     SceIVector2 image_size = { 0, 0 };
 };
 
+// Upper bound for host-side memcpy from guest display RAM (VKState::render_frame / staging buffer).
+// SceDisplay allows up to 1280×725 (handheld) or 1920×1088 (PSTV); a 1024×720 staging buffer was too small.
+inline constexpr uint64_t VITA_DISPLAY_FRAMEBUFFER_MAX_BYTES = static_cast<uint64_t>(1920) * 1088 * 4u;
+
 struct PredictedDisplayFrame {
     DisplayFrameInfo frame_info;
     Address sync_object;

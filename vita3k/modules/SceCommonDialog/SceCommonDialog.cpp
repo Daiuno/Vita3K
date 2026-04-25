@@ -99,7 +99,17 @@ EXPORT(int, sceCommonDialogSetConfigParam) {
 
 EXPORT(int, sceCommonDialogUpdate) {
     TRACY_FUNC(sceCommonDialogUpdate);
-    return UNIMPLEMENTED();
+    // Desktop advances trophy setup via gui::draw_trophy_setup_dialog (timer vs SDL_GetTicks).
+    // Libretro has no ImGui draw path, so without this the dialog stays RUNNING and titles that
+    // wait on setup completion (semaphores / polling) stall at boot.
+    if (emuenv.common_dialog.status == SCE_COMMON_DIALOG_STATUS_RUNNING
+        && emuenv.common_dialog.type == TROPHY_SETUP_DIALOG) {
+        if (static_cast<int64_t>(SDL_GetTicks()) >= static_cast<int64_t>(emuenv.common_dialog.trophy.tick)) {
+            emuenv.common_dialog.status = SCE_COMMON_DIALOG_STATUS_FINISHED;
+            emuenv.common_dialog.result = SCE_COMMON_DIALOG_RESULT_OK;
+        }
+    }
+    return 0;
 }
 
 EXPORT(int, sceCompanionUtilDialogAbort) {

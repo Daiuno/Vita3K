@@ -19,9 +19,14 @@
 
 #include <SDL3/SDL_vulkan.h>
 
+#include <display/state.h>
 #include "renderer/vulkan/state.h"
 #include "util/log.h"
 #include "vkutil/vkutil.h"
+
+#ifdef LIBRETRO
+#include <renderer/vulkan/libretro_vulkan_api.h>
+#endif
 
 #ifdef __ANDROID__
 #include <SDL3/SDL.h>
@@ -63,6 +68,9 @@ bool ScreenRenderer::create(SDL_Window *window) {
 }
 
 bool ScreenRenderer::setup() {
+#ifdef LIBRETRO
+    LOG_INFO("[VITA3K-LR] ScreenRenderer::setup() (SDL window may be null in HW context)");
+#endif
     const auto surface_formats = state.physical_device.getSurfaceFormatsKHR(surface);
     bool surface_format_found = false;
 
@@ -141,10 +149,27 @@ void ScreenRenderer::create_swapchain() {
     if (surface_capabilities.currentExtent.width != std::numeric_limits<uint32_t>::max()) {
         extent = surface_capabilities.currentExtent;
     } else {
-        int width, height;
+#ifdef LIBRETRO
+        // HW context: no SDL window — do not call SDL with nullptr (undefined on iOS).
+        int width = 0;
+        int height = 0;
+        if (window)
+            SDL_GetWindowSizeInPixels(window, &width, &height);
+        if (!window || width == 0 || height == 0) {
+            const auto host = renderer::vulkan::libretro::output_extent_get();
+            extent.width = std::clamp<uint32_t>(host.first, surface_capabilities.minImageExtent.width, surface_capabilities.maxImageExtent.width);
+            extent.height = std::clamp<uint32_t>(host.second, surface_capabilities.minImageExtent.height, surface_capabilities.maxImageExtent.height);
+        } else {
+            extent.width = std::clamp<uint32_t>(width, surface_capabilities.minImageExtent.width, surface_capabilities.maxImageExtent.width);
+            extent.height = std::clamp<uint32_t>(height, surface_capabilities.minImageExtent.height, surface_capabilities.maxImageExtent.height);
+        }
+#else
+        int width = 0;
+        int height = 0;
         SDL_GetWindowSizeInPixels(window, &width, &height);
         extent.width = std::clamp<uint32_t>(width, surface_capabilities.minImageExtent.width, surface_capabilities.maxImageExtent.width);
         extent.height = std::clamp<uint32_t>(height, surface_capabilities.minImageExtent.height, surface_capabilities.maxImageExtent.height);
+#endif
     }
 
     if (extent.width == 0 || extent.height == 0)
@@ -154,7 +179,30 @@ void ScreenRenderer::create_swapchain() {
     if (surface_capabilities.maxImageCount != 0)
         swapchain_size = std::min(swapchain_size, surface_capabilities.maxImageCount);
 
-    // Create Swapchain
+#ifdef LIBRETRO
+    // RetroArch's Vulkan driver already created a swapchain for this VkSurfaceKHR; MoltenVK returns
+    // VK_ERROR_NATIVE_WINDOW_IN_USE_KHR if we create another. Render to offscreen images and hand
+    // frames to the frontend via retro_hw_render_interface_vulkan::set_image (see swap_window).
+    if (libretro_hw_surface) {
+        libretro_swapchain_images.clear();
+        swapchain = nullptr;
+        libretro_swapchain_images.reserve(swapchain_size);
+        swapchain_images.reserve(swapchain_size);
+        swapchain_views.reserve(swapchain_size);
+        for (uint32_t i = 0; i < swapchain_size; i++) {
+            vkutil::Image img(extent.width, extent.height, surface_format.format);
+            vk::ImageUsageFlags usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eSampled;
+            if (!state.is_adreno_turnip && (surface_capabilities.supportedUsageFlags & vk::ImageUsageFlagBits::eStorage))
+                usage |= vk::ImageUsageFlagBits::eStorage;
+            img.init_image(usage);
+            libretro_swapchain_images.push_back(std::move(img));
+            swapchain_images.push_back(libretro_swapchain_images.back().image);
+            swapchain_views.push_back(libretro_swapchain_images.back().view);
+        }
+        libretro_rotating_image_idx = 0;
+        LOG_INFO("[VITA3K-LR] libretro: using offscreen color attachments (no core-owned VkSwapchainKHR)");
+    } else
+#endif
     {
         vk::ImageUsageFlags surface_usage = vk::ImageUsageFlagBits::eColorAttachment;
         vk::ImageUsageFlags fsr_flags = vk::ImageUsageFlagBits::eTransferDst;
@@ -187,24 +235,24 @@ void ScreenRenderer::create_swapchain() {
         };
 
         swapchain = state.device.createSwapchainKHR(swapchain_info);
-    }
 
-    // Get Swapchain Images
-    swapchain_images = state.device.getSwapchainImagesKHR(swapchain);
-    swapchain_size = swapchain_images.size();
+        // Get Swapchain Images
+        swapchain_images = state.device.getSwapchainImagesKHR(swapchain);
+        swapchain_size = swapchain_images.size();
 
-    // Get Image views
-    swapchain_views.resize(swapchain_size);
-    for (uint32_t i = 0; i < swapchain_size; i++) {
-        vk::ImageViewCreateInfo view_info{
-            .image = swapchain_images[i],
-            .viewType = vk::ImageViewType::e2D,
-            .format = surface_format.format,
-            .components = vkutil::default_comp_mapping,
-            .subresourceRange = vkutil::color_subresource_range
-        };
+        // Get Image views
+        swapchain_views.resize(swapchain_size);
+        for (uint32_t i = 0; i < swapchain_size; i++) {
+            vk::ImageViewCreateInfo view_info{
+                .image = swapchain_images[i],
+                .viewType = vk::ImageViewType::e2D,
+                .format = surface_format.format,
+                .components = vkutil::default_comp_mapping,
+                .subresourceRange = vkutil::color_subresource_range
+            };
 
-        swapchain_views[i] = state.device.createImageView(view_info);
+            swapchain_views[i] = state.device.createImageView(view_info);
+        }
     }
 
     swapchain_framebuffers.resize(swapchain_size);
@@ -239,6 +287,16 @@ void ScreenRenderer::destroy_swapchain() {
         state.device.destroy(framebuffer);
     swapchain_framebuffers.clear();
 
+#ifdef LIBRETRO
+    if (libretro_hw_surface) {
+        swapchain_views.clear();
+        swapchain_images.clear();
+        libretro_swapchain_images.clear();
+        swapchain = nullptr;
+        return;
+    }
+#endif
+
     for (vk::ImageView view : swapchain_views)
         state.device.destroy(view);
     swapchain_views.clear();
@@ -253,13 +311,26 @@ void ScreenRenderer::cleanup() {
     state.device.waitIdle();
     for (vk::Framebuffer fb : swapchain_framebuffers)
         state.device.destroy(fb);
+    swapchain_framebuffers.clear();
 
     state.device.destroy(default_render_pass);
     state.device.destroy(post_filter_render_pass);
 
-    for (vk::ImageView view : swapchain_views)
-        state.device.destroy(view);
-    state.device.destroy(swapchain);
+#ifdef LIBRETRO
+    if (libretro_hw_surface) {
+        libretro_swapchain_images.clear();
+        swapchain_views.clear();
+        swapchain_images.clear();
+    } else
+#endif
+    {
+        for (vk::ImageView view : swapchain_views)
+            state.device.destroy(view);
+        swapchain_views.clear();
+        if (swapchain)
+            state.device.destroySwapchainKHR(swapchain);
+        swapchain = nullptr;
+    }
 
     for (uint32_t i = 0; i <= swapchain_size; i++) {
         if (i != swapchain_size)
@@ -269,6 +340,9 @@ void ScreenRenderer::cleanup() {
         state.device.destroy(image_ready_semaphores[i]);
     }
 
+#ifdef LIBRETRO
+    if (!libretro_hw_surface)
+#endif
     state.instance.destroy(surface);
 }
 
@@ -295,6 +369,13 @@ bool ScreenRenderer::acquire_swapchain_image(bool start_render_pass) {
     if (swapchain)
         acquire_result = state.device.acquireNextImageKHR(swapchain,
             next_image_timeout, image_acquired_semaphores[current_frame], vk::Fence(), &swapchain_image_idx);
+#ifdef LIBRETRO
+    else if (libretro_hw_surface) {
+        acquire_result = vk::Result::eSuccess;
+        swapchain_image_idx = libretro_rotating_image_idx;
+        libretro_rotating_image_idx = (libretro_rotating_image_idx + 1) % swapchain_size;
+    }
+#endif
 
     if (acquire_result != vk::Result::eSuccess) {
         if (acquire_result == vk::Result::eErrorOutOfDateKHR
@@ -399,6 +480,46 @@ void ScreenRenderer::swap_window() {
     // first submit the command buffer
     current_cmd_buffer.endRenderPass();
     current_cmd_buffer.end();
+#ifdef LIBRETRO
+    if (libretro_hw_surface && !swapchain) {
+        vk::SubmitInfo submit_info{};
+        submit_info.setCommandBuffers(current_cmd_buffer);
+        state.general_queue.submit(submit_info, fences[swapchain_image_idx]);
+
+        const auto *iface = renderer::vulkan::libretro::hw_render_interface_get();
+        if (iface && iface->set_image && swapchain_image_idx < swapchain_views.size() && swapchain_image_idx < libretro_swapchain_images.size()) {
+            retro_vulkan_image rimg{};
+            rimg.image_view = static_cast<VkImageView>(swapchain_views[swapchain_image_idx]);
+            rimg.image_layout = VK_IMAGE_LAYOUT_GENERAL;
+            rimg.create_info = {};
+            rimg.create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            rimg.create_info.pNext = nullptr;
+            rimg.create_info.flags = 0;
+            rimg.create_info.image = static_cast<VkImage>(libretro_swapchain_images[swapchain_image_idx].image);
+            rimg.create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            rimg.create_info.format = static_cast<VkFormat>(surface_format.format);
+            rimg.create_info.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+            rimg.create_info.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+            rimg.create_info.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+            rimg.create_info.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+            rimg.create_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            rimg.create_info.subresourceRange.baseMipLevel = 0;
+            rimg.create_info.subresourceRange.levelCount = 1;
+            rimg.create_info.subresourceRange.baseArrayLayer = 0;
+            rimg.create_info.subresourceRange.layerCount = 1;
+            iface->set_image(iface->handle, &rimg, 0, nullptr, VK_QUEUE_FAMILY_IGNORED);
+        } else {
+            if (!iface || !iface->set_image)
+                LOG_WARN_ONCE("[VITA3K-LR] retro_hw_render_interface_vulkan.set_image is null; frame not handed to frontend");
+            else
+                LOG_ERROR("[VITA3K-LR] libretro set_image: swapchain_image_idx out of range");
+        }
+
+        swapchain_image_idx = ~0;
+        current_cmd_buffer = nullptr;
+        return;
+    }
+#endif
     vk::SubmitInfo submit_info{};
     std::array<vk::Semaphore, 1> wait_semaphores = { image_acquired_semaphores[current_frame] };
     std::array<vk::PipelineStageFlags, 1> dst_masks
@@ -420,8 +541,17 @@ void ScreenRenderer::swap_window() {
 
     auto result = state.general_queue.presentKHR(&present_info);
     if (result == vk::Result::eSuboptimalKHR) {
-        int width, height;
-        SDL_GetWindowSizeInPixels(window, &width, &height);
+        int width = 0;
+        int height = 0;
+        if (window)
+            SDL_GetWindowSizeInPixels(window, &width, &height);
+#ifdef LIBRETRO
+        if (!window) {
+            swapchain_image_idx = ~0;
+            current_cmd_buffer = nullptr;
+            return;
+        }
+#endif
 
         if (width != extent.width || height != extent.height) {
             state.device.waitIdle();
@@ -499,6 +629,11 @@ void ScreenRenderer::create_layout_sync() {
 }
 
 void ScreenRenderer::create_render_pass() {
+#ifdef LIBRETRO
+    const vk::ImageLayout color_final_layout = libretro_hw_surface ? vk::ImageLayout::eGeneral : vk::ImageLayout::ePresentSrcKHR;
+#else
+    const vk::ImageLayout color_final_layout = vk::ImageLayout::ePresentSrcKHR;
+#endif
     vk::AttachmentDescription color_attachment{
         .format = surface_format.format,
         .samples = vk::SampleCountFlagBits::e1,
@@ -507,7 +642,7 @@ void ScreenRenderer::create_render_pass() {
         .stencilLoadOp = vk::AttachmentLoadOp::eDontCare,
         .stencilStoreOp = vk::AttachmentStoreOp::eDontCare,
         .initialLayout = vk::ImageLayout::eUndefined,
-        .finalLayout = vk::ImageLayout::ePresentSrcKHR
+        .finalLayout = color_final_layout
     };
     vk::AttachmentReference attachment_ref{
         .attachment = 0,
@@ -554,8 +689,7 @@ void ScreenRenderer::create_surface_image() {
     vita_surface.resize(swapchain_size);
 
     vk::BufferCreateInfo buffer_info{
-        // make sure it is big enough
-        .size = 1024 * 720 * sizeof(uint32_t),
+        .size = static_cast<vk::DeviceSize>(VITA_DISPLAY_FRAMEBUFFER_MAX_BYTES),
         .usage = vk::BufferUsageFlagBits::eTransferSrc,
         .sharingMode = vk::SharingMode::eExclusive
     };
@@ -565,20 +699,37 @@ void ScreenRenderer::create_surface_image() {
 bool ScreenRenderer::rebuild_swapchain_if_visible() {
     state.device.waitIdle();
     destroy_swapchain();
-    int width, height;
-    SDL_GetWindowSizeInPixels(window, &width, &height);
+    int width = 0;
+    int height = 0;
+    if (window)
+        SDL_GetWindowSizeInPixels(window, &width, &height);
+#ifdef LIBRETRO
+    else {
+        const auto host = renderer::vulkan::libretro::output_extent_get();
+        width = static_cast<int>(host.first);
+        height = static_cast<int>(host.second);
+    }
+#endif
     // don't render anything when the window is minimized
     if (width == 0 || height == 0)
         return false;
 
     create_swapchain();
+#ifdef LIBRETRO
+    if (swapchain || libretro_hw_surface)
+#else
     if (swapchain)
+#endif
         need_rebuild = true;
 
     return true;
 }
 
 bool ScreenRenderer::surface_matches_window_size() {
+#ifdef LIBRETRO
+    if (!window)
+        return true;
+#endif
     int width, height;
     SDL_GetWindowSizeInPixels(window, &width, &height);
     // if we're minimized, assume the current size is OK

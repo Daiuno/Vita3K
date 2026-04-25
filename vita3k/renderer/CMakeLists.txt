@@ -21,6 +21,7 @@ add_library(
 	src/vulkan/gxm_to_vulkan.cpp
 	src/vulkan/pipeline_cache.cpp
 	src/vulkan/renderer.cpp
+	src/vulkan/libretro_vulkan_api.cpp
 	src/vulkan/scene.cpp
 	src/vulkan/screen_filters.cpp
 	src/vulkan/screen_renderer.cpp
@@ -46,6 +47,9 @@ add_library(
 )
 
 target_include_directories(renderer PUBLIC include)
+if(LIBRETRO)
+	target_include_directories(renderer PRIVATE "${CMAKE_SOURCE_DIR}/libretro/libretro-common/include")
+endif()
 target_link_libraries(renderer PUBLIC display mem stb shader glutil threads config util vkutil)
 target_link_libraries(renderer PRIVATE ddspp SDL3::SDL3 stb ffmpeg xxHash::xxhash concurrentqueue)
 

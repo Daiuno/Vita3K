@@ -35,6 +35,9 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
+#if defined(LIBRETRO) && defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
 
 constexpr uint32_t STANDARD_PAGE_SIZE = KiB(4);
 constexpr size_t TOTAL_MEM_SIZE = GiB(4);
@@ -62,15 +65,105 @@ static std::string get_error_msg() {
 }
 #endif
 
+#ifdef LIBRETRO
+static void commit_guest_rw(MemState &state, Address guest_start, uint32_t guest_bytes) {
+    if (guest_bytes == 0)
+        return;
+#ifdef _WIN32
+    uint8_t *const p = &state.memory[guest_start];
+    const void *const ret = VirtualAlloc(p, guest_bytes, MEM_COMMIT, PAGE_READWRITE);
+    LOG_CRITICAL_IF(!ret, "VirtualAlloc failed: {}", get_error_msg());
+#else
+    if (state.host_page_size > state.page_size) {
+        const Address host_start = align_down(guest_start, static_cast<uint64_t>(state.host_page_size));
+        const Address host_end = align(guest_start + guest_bytes, static_cast<uint64_t>(state.host_page_size));
+        uint8_t *const p = &state.memory[host_start];
+        const size_t len = host_end - host_start;
+        const int ret = mprotect(p, len, PROT_READ | PROT_WRITE);
+        LOG_CRITICAL_IF(ret == -1, "mprotect failed: {}", get_error_msg());
+        return;
+    }
+    uint8_t *const p = &state.memory[guest_start];
+    const int ret = mprotect(p, guest_bytes, PROT_READ | PROT_WRITE);
+    LOG_CRITICAL_IF(ret == -1, "mprotect failed: {}", get_error_msg());
+#endif
+}
+
+static void decommit_guest_none(MemState &state, Address guest_start, uint32_t guest_bytes) {
+    if (guest_bytes == 0)
+        return;
+#ifdef _WIN32
+    uint8_t *const p = &state.memory[guest_start];
+    const BOOL ret = VirtualFree(p, guest_bytes, MEM_DECOMMIT);
+    LOG_CRITICAL_IF(!ret, "VirtualFree failed: {}", get_error_msg());
+#else
+    if (state.host_page_size > state.page_size) {
+        // Several guest 4 KiB pages can map into one host page (e.g. 16 KiB on iOS). Applying
+        // PROT_NONE to the host-aligned range would remove RW from *all* guest pages in that
+        // host page — including allocations that are still live (e.g. another module segment),
+        // which then crashes later (EXC_BAD_ACCESS in relocate_entry / memcpy).
+        // Physical backing may linger until process exit; the allocator bitmap is authoritative.
+        return;
+    }
+    uint8_t *const p = &state.memory[guest_start];
+    int ret = mprotect(p, guest_bytes, PROT_NONE);
+    LOG_CRITICAL_IF(ret == -1, "mprotect failed: {}", get_error_msg());
+    ret = madvise(p, guest_bytes, MADV_DONTNEED);
+    LOG_CRITICAL_IF(ret == -1, "madvise failed: {}", get_error_msg());
+#endif
+}
+
+void ensure_guest_page_mapped_rw(MemState &state, Address vaddr) noexcept {
+    if (state.host_page_size <= state.page_size)
+        return;
+    const Address guest_page = align_down(vaddr, static_cast<uint64_t>(state.page_size));
+#ifdef _WIN32
+    thread_local Address cache_guest_page = UINT32_MAX;
+    if (cache_guest_page == guest_page)
+        return;
+    commit_guest_rw(state, guest_page, state.page_size);
+    cache_guest_page = guest_page;
+#else
+    const Address host_lo = align_down(guest_page, static_cast<uint64_t>(state.host_page_size));
+    const Address host_hi = align(guest_page + state.page_size, static_cast<uint64_t>(state.host_page_size));
+    thread_local Address cache_lo = UINT32_MAX;
+    thread_local Address cache_hi = 0;
+    if (cache_lo != UINT32_MAX && host_lo == cache_lo && host_hi == cache_hi)
+        return;
+    commit_guest_rw(state, guest_page, state.page_size);
+    cache_lo = host_lo;
+    cache_hi = host_hi;
+#endif
+}
+#endif // LIBRETRO
+
+#ifndef LIBRETRO
+void ensure_guest_page_mapped_rw(MemState &state, Address vaddr) noexcept {
+    (void)state;
+    (void)vaddr;
+}
+#endif
+
 bool init(MemState &state, const bool use_page_table) {
 #ifdef _WIN32
     SYSTEM_INFO system_info = {};
     GetSystemInfo(&system_info);
-    state.page_size = system_info.dwPageSize;
+    const uint32_t system_page = system_info.dwPageSize;
 #else
-    state.page_size = static_cast<int>(sysconf(_SC_PAGESIZE));
+    const uint32_t system_page = static_cast<uint32_t>(sysconf(_SC_PAGESIZE));
 #endif
-    state.page_size = std::max(STANDARD_PAGE_SIZE, state.page_size);
+#ifdef LIBRETRO
+    state.host_page_size = std::max(STANDARD_PAGE_SIZE, system_page);
+    // Guest (PS Vita) uses 4 KiB pages; the allocator bitmap must match ELF segment boundaries.
+    // Using the OS page size (e.g. 16 KiB on recent iOS) would merge adjacent SELF segments and break allocate_at.
+    state.page_size = STANDARD_PAGE_SIZE;
+    if (state.host_page_size > state.page_size) {
+        LOG_INFO("Guest page size {} B, host page size {} B (mprotect rounded to host pages).",
+            state.page_size, state.host_page_size);
+    }
+#else
+    state.page_size = std::max(STANDARD_PAGE_SIZE, system_page);
+#endif
 
     assert(state.page_size >= 4096); // Limit imposed by Unicorn.
     assert(!use_page_table || state.page_size == KiB(4));
@@ -114,13 +207,25 @@ bool init(MemState &state, const bool use_page_table) {
     register_access_violation_handler(handler);
 
     const Address null_address = alloc_inner(state, 0, 1, "null", true);
+    if (state.allocator.free_slot_count(0, 1) != 0) {
+        LOG_CRITICAL("Failed to allocate null page (allocator bitmap not reserved)");
+        return false;
+    }
     assert(null_address == 0);
 #ifdef _WIN32
     DWORD old_protect = 0;
+#ifdef LIBRETRO
+    const BOOL ret = VirtualProtect(state.memory.get(), state.host_page_size, PAGE_NOACCESS, &old_protect);
+#else
     const BOOL ret = VirtualProtect(state.memory.get(), state.page_size, PAGE_NOACCESS, &old_protect);
-    LOG_CRITICAL_IF(!ret, "VirtualAlloc failed: {}", get_error_msg());
+#endif
+    LOG_CRITICAL_IF(!ret, "VirtualProtect failed: {}", get_error_msg());
 #elif !defined(__ANDROID__)
+#ifdef LIBRETRO
+    const int ret = mprotect(state.memory.get(), state.host_page_size, PROT_NONE);
+#else
     const int ret = mprotect(state.memory.get(), state.page_size, PROT_NONE);
+#endif
     LOG_CRITICAL_IF(ret == -1, "mprotect failed: {}", get_error_msg());
 #endif
 
@@ -161,6 +266,7 @@ static Address alloc_inner(MemState &state, uint32_t start_page, uint32_t page_c
     if (force) {
         if (state.allocator.allocate_at(start_page, page_count) < 0) {
             LOG_CRITICAL("Failed to allocate at specific page");
+            return 0;
         }
         page_num = start_page;
     } else {
@@ -171,9 +277,11 @@ static Address alloc_inner(MemState &state, uint32_t start_page, uint32_t page_c
 
     const uint32_t size = page_count * state.page_size;
     const Address addr = page_num * state.page_size;
-    uint8_t *const memory = &state.memory[addr];
 
-    // Make memory chunk available to access
+#ifdef LIBRETRO
+    commit_guest_rw(state, addr, size);
+#else
+    uint8_t *const memory = &state.memory[addr];
 #ifdef _WIN32
     const void *const ret = VirtualAlloc(memory, size, MEM_COMMIT, PAGE_READWRITE);
     LOG_CRITICAL_IF(!ret, "VirtualAlloc failed: {}", get_error_msg());
@@ -181,7 +289,8 @@ static Address alloc_inner(MemState &state, uint32_t start_page, uint32_t page_c
     const int ret = mprotect(memory, size, PROT_READ | PROT_WRITE);
     LOG_CRITICAL_IF(ret == -1, "mprotect failed: {}", get_error_msg());
 #endif
-    std::memset(memory, 0, size);
+#endif
+    std::memset(&state.memory[addr], 0, size);
 
     AllocMemPage &page = state.alloc_table[page_num];
     assert(!page.allocated);
@@ -234,8 +343,17 @@ void unprotect_inner(MemState &state, Address addr, uint32_t size) {
 #ifdef _WIN32
     DWORD old_protect = 0;
     const BOOL ret = VirtualProtect(&addr_ptr[addr], size - 1, PAGE_READWRITE, &old_protect);
-    LOG_CRITICAL_IF(!ret, "VirtualAlloc failed: {}", get_error_msg());
+    LOG_CRITICAL_IF(!ret, "VirtualProtect failed: {}", get_error_msg());
 #else
+#ifdef LIBRETRO
+    if (state.host_page_size > state.page_size) {
+        const Address host_start = align_down(addr, static_cast<uint64_t>(state.host_page_size));
+        const Address host_end = align(addr + size, static_cast<uint64_t>(state.host_page_size));
+        const int ret = mprotect(&addr_ptr[host_start], host_end - host_start, PROT_READ | PROT_WRITE);
+        LOG_CRITICAL_IF(ret == -1, "mprotect failed: {}", get_error_msg());
+        return;
+    }
+#endif
     const int ret = mprotect(&addr_ptr[addr], size, PROT_READ | PROT_WRITE);
     LOG_CRITICAL_IF(ret == -1, "mprotect failed: {}", get_error_msg());
 #endif
@@ -247,9 +365,19 @@ void protect_inner(MemState &state, Address addr, uint32_t size, const MemPerm p
 #ifdef _WIN32
     DWORD old_protect = 0;
     const BOOL ret = VirtualProtect(&addr_ptr[addr], size - 1, (perm == MemPerm::None) ? PAGE_NOACCESS : ((perm == MemPerm::ReadOnly) ? PAGE_READONLY : PAGE_READWRITE), &old_protect);
-    LOG_CRITICAL_IF(!ret, "VirtualAlloc failed: {}", get_error_msg());
+    LOG_CRITICAL_IF(!ret, "VirtualProtect failed: {}", get_error_msg());
 #else
-    const int ret = mprotect(&addr_ptr[addr], size, (perm == MemPerm::None) ? PROT_NONE : ((perm == MemPerm::ReadOnly) ? PROT_READ : (PROT_READ | PROT_WRITE)));
+    const int prot = (perm == MemPerm::None) ? PROT_NONE : ((perm == MemPerm::ReadOnly) ? PROT_READ : (PROT_READ | PROT_WRITE));
+#ifdef LIBRETRO
+    if (state.host_page_size > state.page_size) {
+        const Address host_start = align_down(addr, static_cast<uint64_t>(state.host_page_size));
+        const Address host_end = align(addr + size, static_cast<uint64_t>(state.host_page_size));
+        const int ret = mprotect(&addr_ptr[host_start], host_end - host_start, prot);
+        LOG_CRITICAL_IF(ret == -1, "mprotect failed: {}", get_error_msg());
+        return;
+    }
+#endif
+    const int ret = mprotect(&addr_ptr[addr], size, prot);
     LOG_CRITICAL_IF(ret == -1, "mprotect failed: {}", get_error_msg());
 #endif
 }
@@ -356,7 +484,7 @@ bool is_protecting(MemState &state, Address addr, MemPerm *perm) {
     const std::lock_guard<std::mutex> lock(state.protect_mutex);
     auto ite = state.protect_tree.lower_bound(addr);
 
-    if (ite != state.protect_tree.end() && addr < ite->first + ite->second.size) {
+    if (ite != state.protect_tree.end() && addr >= ite->first && addr < ite->first + ite->second.size) {
         if (perm)
             *perm = ite->second.perm;
 
@@ -364,6 +492,34 @@ bool is_protecting(MemState &state, Address addr, MemPerm *perm) {
     }
 
     return false;
+}
+
+void sync_guest_write_if_protected(MemState &state, Address vaddr) noexcept {
+#if defined(LIBRETRO) && defined(__APPLE__) && TARGET_OS_IOS
+    const std::unique_lock<std::mutex> lock(state.protect_mutex);
+    auto ite = state.protect_tree.lower_bound(vaddr);
+    if (ite == state.protect_tree.end()) {
+        return;
+    }
+    if (vaddr < ite->first || vaddr >= ite->first + ite->second.size) {
+        return;
+    }
+    const MemPerm perm = ite->second.perm;
+    const bool write_blocked = (perm == MemPerm::None) || (perm == MemPerm::ReadOnly);
+    if (!write_blocked) {
+        return;
+    }
+    ProtectSegmentInfo &info = ite->second;
+    const Address seg_begin = ite->first;
+    for (auto &[block_addr, block] : info.blocks) {
+        block.callback(vaddr, true);
+    }
+    unprotect_inner(state, seg_begin, info.size);
+    state.protect_tree.erase(ite);
+#else
+    (void)state;
+    (void)vaddr;
+#endif
 }
 
 void add_external_mapping(MemState &mem, Address addr, uint32_t size, uint8_t *addr_ptr) {
@@ -451,8 +607,7 @@ Address alloc_at(MemState &state, Address address, uint32_t size, const char *na
     const uint32_t wanted_page = address / state.page_size;
     size += address % state.page_size;
     const uint32_t page_count = align(size, state.page_size) / state.page_size;
-    alloc_inner(state, wanted_page, page_count, name, true);
-    return address;
+    return alloc_inner(state, wanted_page, page_count, name, true);
 }
 
 Address try_alloc_at(MemState &state, Address address, uint32_t size, const char *name) {
@@ -462,8 +617,7 @@ Address try_alloc_at(MemState &state, Address address, uint32_t size, const char
     if (state.allocator.free_slot_count(wanted_page, wanted_page + page_count) != page_count) {
         return 0;
     }
-    (void)alloc_inner(state, wanted_page, page_count, name, true);
-    return address;
+    return alloc_inner(state, wanted_page, page_count, name, true);
 }
 
 Block alloc_block(MemState &mem, uint32_t size, const char *name, Address start_addr) {
@@ -490,6 +644,11 @@ void free(MemState &state, Address address) {
     }
 
     assert(!state.use_page_table || state.page_table[address / KiB(4)] == state.memory.get());
+#ifdef LIBRETRO
+    const Address guest_start = page_num * state.page_size;
+    const uint32_t guest_bytes = page.size * state.page_size;
+    decommit_guest_none(state, guest_start, guest_bytes);
+#else
     uint8_t *const memory = &state.memory[page_num * state.page_size];
 
 #ifdef _WIN32
@@ -500,6 +659,7 @@ void free(MemState &state, Address address) {
     LOG_CRITICAL_IF(ret == -1, "mprotect failed: {}", get_error_msg());
     ret = madvise(memory, page.size * state.page_size, MADV_DONTNEED);
     LOG_CRITICAL_IF(ret == -1, "madvise failed: {}", get_error_msg());
+#endif
 #endif
 }
 

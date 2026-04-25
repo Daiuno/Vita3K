@@ -29,6 +29,7 @@
 #include <renderer/vulkan/types.h>
 
 #include <renderer/functions.h>
+#include <util/log.h>
 #include <util/tracy.h>
 
 namespace renderer {
@@ -128,11 +129,19 @@ bool wishlist(SceGxmSyncObject *sync_object, const uint32_t timestamp, const int
     if (sync_object->timestamp_current < timestamp) {
         const auto &pred = [&]() { return sync_object->timestamp_current >= timestamp; };
 
+        LOG_INFO("[GXM-SYNC] wishlist BLOCK: curr={} need={} timeout={}",
+                 sync_object->timestamp_current.load(), timestamp, timeout_micros);
+
         if (timeout_micros == -1) {
             sync_object->cond.wait(lock, pred);
+            LOG_INFO("[GXM-SYNC] wishlist UNBLOCK: curr={} need={}",
+                     sync_object->timestamp_current.load(), timestamp);
             return true;
         } else {
-            return sync_object->cond.wait_for(lock, std::chrono::microseconds(timeout_micros), pred);
+            bool ok = sync_object->cond.wait_for(lock, std::chrono::microseconds(timeout_micros), pred);
+            LOG_INFO("[GXM-SYNC] wishlist WAKE: curr={} need={} ok={}",
+                     sync_object->timestamp_current.load(), timestamp, ok);
+            return ok;
         }
     } else {
         return true;

@@ -398,6 +398,10 @@ static ExitCode load_app_impl(SceUID &main_module_id, EmuEnvState &emuenv) {
     const auto call_import = [&emuenv](CPUState &cpu, uint32_t nid, SceUID thread_id) {
         ::call_import(emuenv, cpu, nid, thread_id);
     };
+    emuenv.kernel.cpu_opt = emuenv.cfg.current_config.cpu_opt;
+#ifdef LIBRETRO
+    emuenv.kernel.cpu_backend = emuenv.cfg.cpu_backend;
+#endif
     if (!emuenv.kernel.init(emuenv.mem, call_import, emuenv.kernel.cpu_opt)) {
         LOG_WARN("Failed to init kernel!");
         return KernelInitFailed;

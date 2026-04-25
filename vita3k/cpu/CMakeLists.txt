@@ -4,12 +4,14 @@ include/cpu/common.h
 include/cpu/functions.h
 include/cpu/impl/dynarmic_cpu.h
 include/cpu/impl/interface.h
+include/cpu/impl/ir_interpreter_cpu.h
 include/cpu/disasm/functions.h
 include/cpu/disasm/state.h
 
 src/disasm.cpp
 src/cpu.cpp
 src/dynarmic_cpu.cpp
+src/ir_interpreter_cpu.cpp
 )
 
 add_library(

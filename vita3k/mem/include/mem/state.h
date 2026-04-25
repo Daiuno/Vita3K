@@ -66,7 +66,12 @@ struct MemState {
     std::mutex generation_mutex;
     std::mutex protect_mutex;
 
+    /// Guest allocator page size: fixed 4 KiB in libretro builds; `max(4 KiB, OS page)` in standalone (see mem::init).
     uint32_t page_size = 0;
+#ifdef LIBRETRO
+    /// Libretro only: OS page size (e.g. 16 KiB on recent iOS). Rounds mprotect when guest pages stay 4 KiB.
+    uint32_t host_page_size = 0;
+#endif
     Memory memory;
     AllocPageTable alloc_table;
     BitmapAllocator allocator;

@@ -46,8 +46,20 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
                 const std::lock_guard<std::mutex> guard_info(display.display_info_mutex);
                 ++display.vblank_count;
 
-                // in this case, even though no new game frames are being rendered, we still need to update the screen
-                if (emuenv.kernel.is_threads_paused() || (emuenv.common_dialog.status == SCE_COMMON_DIALOG_STATUS_RUNNING))
+                // In this case, even though no new game frames are being rendered, we still need to
+                // update the screen (desktop ImGui: paused state or common dialog overlay).
+#if defined(LIBRETRO)
+                // Libretro has no ImGui common-dialog draw path. The vblank thread was still setting
+                // should_display while a dialog is "RUNNING" (message/trophy wait). That interacts badly
+                // with renderer::process_batches(), which only drains the GXM queue while
+                // should_display is false — flipping should_display here starves GPU work during loads
+                // and guest threads then hit WaitSema timeouts (e.g. Limbo after limbo_runtime.pkgpsp2).
+                const bool need_ui_vblank_refresh = emuenv.kernel.is_threads_paused();
+#else
+                const bool need_ui_vblank_refresh = emuenv.kernel.is_threads_paused()
+                    || (emuenv.common_dialog.status == SCE_COMMON_DIALOG_STATUS_RUNNING);
+#endif
+                if (need_ui_vblank_refresh)
                     // only display the UI/common dialog at 30 fps
                     // this is necessary so that the command buffer processing doesn't get starved
                     // with vsync enabled and a screen with a refresh rate of 60Hz or less

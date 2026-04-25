@@ -23,10 +23,20 @@
 #include <cpu/common.h>
 
 #include <cstdint>
+#include <string>
 
 struct MemState;
 
-CPUStatePtr init_cpu(bool cpu_opt, SceUID thread_id, std::size_t processor_id, MemState &mem, CPUProtocolBase *protocol);
+#ifdef LIBRETRO
+// Libretro / full-engine: `cpu_backend` selects between backends:
+//   - "dynarmic_jit"          -> DynarmicCPU (JIT, fast path)
+//   - "ir_interpreter"        -> IRInterpreterCPU (M12 PPSSPP-style IR)
+//   - anything else           -> DynarmicCPU with cpu_opt=false (slow fallback)
+#else
+// `cpu_backend` is reserved for API compatibility; standalone builds always use Dynarmic JIT in init_cpu().
+#endif
+CPUStatePtr init_cpu(bool cpu_opt, const std::string &cpu_backend, SceUID thread_id,
+                     std::size_t processor_id, MemState &mem, CPUProtocolBase *protocol);
 int run(CPUState &state);
 int step(CPUState &state);
 void stop(CPUState &state);

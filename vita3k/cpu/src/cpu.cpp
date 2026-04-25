@@ -19,9 +19,15 @@
 #include <cpu/functions.h>
 #include <cpu/impl/dynarmic_cpu.h>
 #include <cpu/impl/interface.h>
+#ifdef LIBRETRO
+#include <cpu/impl/ir_interpreter_cpu.h>
+#endif
 #include <cpu/state.h>
 #include <mem/ptr.h>
+#include <util/log.h>
 #include <util/types.h>
+
+#include <dynarmic/interface/exclusive_monitor.h>
 
 #include <memory>
 #include <string>
@@ -38,7 +44,8 @@ SceUID get_thread_id(CPUState &state) {
     return state.thread_id;
 }
 
-CPUStatePtr init_cpu(bool cpu_opt, SceUID thread_id, std::size_t processor_id, MemState &mem, CPUProtocolBase *protocol) {
+CPUStatePtr init_cpu(bool cpu_opt, const std::string &cpu_backend, SceUID thread_id,
+                     std::size_t processor_id, MemState &mem, CPUProtocolBase *protocol) {
     CPUStatePtr state(new CPUState(), delete_cpu_state);
     state->mem = &mem;
     state->protocol = protocol;
@@ -57,7 +64,30 @@ CPUStatePtr init_cpu(bool cpu_opt, SceUID thread_id, std::size_t processor_id, M
     }
 
     Dynarmic::ExclusiveMonitor *monitor = static_cast<Dynarmic::ExclusiveMonitor *>(protocol->get_exclusive_monitor());
+
+#ifdef LIBRETRO
+    // M12: pick backend. Only "ir_interpreter" routes away from Dynarmic;
+    // "fallback_interpreter" reuses DynarmicCPU with cpu_opt=false (M11.3
+    // will expand on this). Anything else defaults to Dynarmic JIT honouring
+    // the cpu_opt flag from config.
+    if (cpu_backend == "ir_interpreter") {
+        LOG_INFO("CPU backend: IR cache-interpreter (M12) [core {}]", processor_id);
+        state->cpu = std::make_unique<IRInterpreterCPU>(state.get(), processor_id, monitor);
+    } else {
+        if (cpu_backend == "fallback_interpreter") {
+            LOG_INFO("CPU backend: Dynarmic fallback (cpu_opt=false) [core {}]", processor_id);
+            state->cpu = std::make_unique<DynarmicCPU>(state.get(), processor_id, monitor, /*cpu_opt=*/false);
+        } else {
+            if (!cpu_backend.empty() && cpu_backend != "dynarmic_jit") {
+                LOG_WARN("CPU backend '{}' not recognised; defaulting to dynarmic_jit", cpu_backend);
+            }
+            state->cpu = std::make_unique<DynarmicCPU>(state.get(), processor_id, monitor, cpu_opt);
+        }
+    }
+#else
+    (void)cpu_backend;
     state->cpu = std::make_unique<DynarmicCPU>(state.get(), processor_id, monitor, cpu_opt);
+#endif
 
     return state;
 }

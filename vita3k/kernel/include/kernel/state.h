@@ -33,6 +33,7 @@
 #include <atomic>
 #include <map>
 #include <mutex>
+#include <string>
 #include <vector>
 
 struct ThreadState;
@@ -132,7 +133,9 @@ struct KernelState {
     VarBindingInfos var_binding_infos;
     ModuleUidByNid module_uid_by_nid;
 
-    bool cpu_opt;
+    bool cpu_opt = true;
+    /// Mirrors `Config::cpu_backend`. IR interpreter / backend selection is applied only when `LIBRETRO` is defined (see cpu.cpp).
+    std::string cpu_backend = "dynarmic_jit";
     CorenumAllocator corenum_allocator;
     CPUProtocolPtr cpu_protocol;
     ExclusiveMonitorPtr exclusive_monitor;

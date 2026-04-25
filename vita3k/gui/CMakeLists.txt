@@ -7,7 +7,6 @@ set(GUI_SOURCES
 	include/gui/state.h
 	src/app_context_menu.cpp
 	src/archive_install_dialog.cpp
-	src/bgm_player.cpp
 	src/common_dialog.cpp
 	src/compile_shaders.cpp
 	src/condvars_dialog.cpp
@@ -49,8 +48,17 @@ set(GUI_SOURCES
 	src/welcome_dialog.cpp
 )
 
-# Add macOS-specific Objective-C++ files
-if(APPLE)
+# Use the cubeb-backed BGM player on every platform that has cubeb; on iOS
+# the cubeb backend is unavailable, so swap in a stub implementation.
+if(IOS)
+	list(APPEND GUI_SOURCES src/bgm_player_stub.cpp)
+else()
+	list(APPEND GUI_SOURCES src/bgm_player.cpp)
+endif()
+
+# Add macOS-specific Objective-C++ files (NSWorkspace, drag-and-drop, ...).
+# Skip on iOS: those macOS-only APIs aren't available there.
+if(APPLE AND NOT IOS)
 	list(APPEND GUI_SOURCES
 		include/gui/macos_helper.h
 		src/macos_helper.mm
@@ -61,9 +69,13 @@ add_library(gui STATIC ${GUI_SOURCES})
 
 target_include_directories(gui PUBLIC include ${CMAKE_SOURCE_DIR}/vita3k)
 target_link_libraries(gui PUBLIC app codec compat config dialog emuenv ime imgui lang regmgr np)
-target_link_libraries(gui PRIVATE audio camera cubeb cppcommon ctrl kernel miniz motion psvpfsparser pugixml::pugixml stb renderer packages SDL3::SDL3 touch vkutil host::dialog concurrentqueue)
+if(IOS)
+	target_link_libraries(gui PRIVATE audio camera cppcommon ctrl kernel miniz motion psvpfsparser pugixml::pugixml stb renderer packages SDL3::SDL3 touch vkutil host::dialog concurrentqueue)
+else()
+	target_link_libraries(gui PRIVATE audio camera cubeb cppcommon ctrl kernel miniz motion psvpfsparser pugixml::pugixml stb renderer packages SDL3::SDL3 touch vkutil host::dialog concurrentqueue)
+endif()
 # Link macOS frameworks for Objective-C++ code
-if(APPLE)
+if(APPLE AND NOT IOS)
 	target_link_libraries(gui PRIVATE
 		"-framework Foundation"
 		"-framework ImageIO"

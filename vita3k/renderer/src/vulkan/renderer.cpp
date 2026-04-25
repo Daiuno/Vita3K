@@ -35,6 +35,14 @@
 
 #include <SDL3/SDL_vulkan.h>
 
+#ifdef LIBRETRO
+#include <map>
+#include <renderer/vulkan/libretro_vulkan_api.h>
+#if defined(__APPLE__)
+#include <os/log.h>
+#endif
+#endif
+
 #ifdef __APPLE__
 #include <MoltenVK/mvk_vulkan.h>
 #endif
@@ -373,7 +381,559 @@ static void *load_custom_adreno_driver(const std::string &driver_name) {
 }
 #endif
 
+#ifdef LIBRETRO
+namespace {
+
+/// Some loaders only expose swapchain/WSI via vkGetDeviceProcAddr; instance init can leave PFNs null.
+static void vita3k_lr_ensure_wsi_swapchain_dispatch(PFN_vkGetInstanceProcAddr ipa, VkInstance inst, VkDevice dev) {
+    auto &d = VULKAN_HPP_DEFAULT_DISPATCHER;
+    if (!ipa || !inst || !dev)
+        return;
+
+    if (!d.vkGetPhysicalDeviceSurfaceFormatsKHR)
+        d.vkGetPhysicalDeviceSurfaceFormatsKHR = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceFormatsKHR>(
+            ipa(inst, "vkGetPhysicalDeviceSurfaceFormatsKHR"));
+    if (!d.vkGetPhysicalDeviceSurfacePresentModesKHR)
+        d.vkGetPhysicalDeviceSurfacePresentModesKHR = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfacePresentModesKHR>(
+            ipa(inst, "vkGetPhysicalDeviceSurfacePresentModesKHR"));
+    if (!d.vkGetPhysicalDeviceSurfaceCapabilitiesKHR)
+        d.vkGetPhysicalDeviceSurfaceCapabilitiesKHR = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(
+            ipa(inst, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR"));
+    if (!d.vkGetPhysicalDeviceSurfaceSupportKHR)
+        d.vkGetPhysicalDeviceSurfaceSupportKHR = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceSupportKHR>(
+            ipa(inst, "vkGetPhysicalDeviceSurfaceSupportKHR"));
+    if (!d.vkDestroySurfaceKHR)
+        d.vkDestroySurfaceKHR = reinterpret_cast<PFN_vkDestroySurfaceKHR>(ipa(inst, "vkDestroySurfaceKHR"));
+
+    PFN_vkGetDeviceProcAddr gdpa = d.vkGetDeviceProcAddr;
+    if (!gdpa)
+        gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(ipa(inst, "vkGetDeviceProcAddr"));
+    if (!gdpa)
+        return;
+
+    if (!d.vkCreateSwapchainKHR)
+        d.vkCreateSwapchainKHR = reinterpret_cast<PFN_vkCreateSwapchainKHR>(gdpa(dev, "vkCreateSwapchainKHR"));
+    if (!d.vkDestroySwapchainKHR)
+        d.vkDestroySwapchainKHR = reinterpret_cast<PFN_vkDestroySwapchainKHR>(gdpa(dev, "vkDestroySwapchainKHR"));
+    if (!d.vkGetSwapchainImagesKHR)
+        d.vkGetSwapchainImagesKHR = reinterpret_cast<PFN_vkGetSwapchainImagesKHR>(gdpa(dev, "vkGetSwapchainImagesKHR"));
+    if (!d.vkAcquireNextImageKHR)
+        d.vkAcquireNextImageKHR = reinterpret_cast<PFN_vkAcquireNextImageKHR>(gdpa(dev, "vkAcquireNextImageKHR"));
+    if (!d.vkQueuePresentKHR)
+        d.vkQueuePresentKHR = reinterpret_cast<PFN_vkQueuePresentKHR>(gdpa(dev, "vkQueuePresentKHR"));
+}
+
+/// MoltenVK + some RetroArch loaders: core device command pointers can stay NULL after
+/// DispatchLoaderDynamic::init(device) if only gdpa(device,...) resolves them.
+static void vita3k_lr_ensure_device_command_dispatch(PFN_vkGetInstanceProcAddr ipa, VkInstance inst, VkDevice dev) {
+    auto &d = VULKAN_HPP_DEFAULT_DISPATCHER;
+    PFN_vkGetDeviceProcAddr gdpa = d.vkGetDeviceProcAddr;
+    if (!gdpa)
+        gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(ipa(inst, "vkGetDeviceProcAddr"));
+    if (!gdpa)
+        return;
+
+#define V3K_LR_GDP(sym) \
+    if (!d.sym) \
+        d.sym = reinterpret_cast<PFN_##sym>(gdpa(dev, #sym))
+
+    V3K_LR_GDP(vkAllocateCommandBuffers);
+    V3K_LR_GDP(vkFreeCommandBuffers);
+    V3K_LR_GDP(vkBeginCommandBuffer);
+    V3K_LR_GDP(vkEndCommandBuffer);
+    V3K_LR_GDP(vkResetCommandBuffer);
+    V3K_LR_GDP(vkQueueSubmit);
+    V3K_LR_GDP(vkQueueWaitIdle);
+    V3K_LR_GDP(vkCmdPipelineBarrier);
+    V3K_LR_GDP(vkCmdClearColorImage);
+    V3K_LR_GDP(vkCreateImageView);
+    V3K_LR_GDP(vkCreateBuffer);
+    V3K_LR_GDP(vkCreateImage);
+    V3K_LR_GDP(vkCreateSampler);
+    V3K_LR_GDP(vkBindBufferMemory);
+    V3K_LR_GDP(vkBindImageMemory);
+    V3K_LR_GDP(vkGetBufferMemoryRequirements);
+    V3K_LR_GDP(vkGetImageMemoryRequirements);
+    V3K_LR_GDP(vkAllocateMemory);
+    V3K_LR_GDP(vkFreeMemory);
+    V3K_LR_GDP(vkMapMemory);
+    V3K_LR_GDP(vkUnmapMemory);
+    V3K_LR_GDP(vkFlushMappedMemoryRanges);
+    V3K_LR_GDP(vkInvalidateMappedMemoryRanges);
+#undef V3K_LR_GDP
+}
+
+/// MoltenVK + RetroArch: VMA_DYNAMIC_VULKAN_FUNCTIONS may leave required PFNs null when only ipa/gdpa
+/// are passed; allocator then crashes on first vmaCreateBuffer. Fill every field VMA may assert on.
+static vma::VulkanFunctions vita3k_lr_build_vma_vulkan_functions(PFN_vkGetInstanceProcAddr ipa, VkInstance inst, VkDevice dev) {
+    vma::VulkanFunctions vf{};
+    if (!ipa || !inst || !dev)
+        return vf;
+
+    vf.vkGetInstanceProcAddr = ipa;
+    PFN_vkGetDeviceProcAddr gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(ipa(inst, "vkGetDeviceProcAddr"));
+    vf.vkGetDeviceProcAddr = gdpa;
+    if (!gdpa)
+        return vf;
+
+    auto inst_sym = [&](const char *name) -> void * {
+        return reinterpret_cast<void *>(ipa(inst, name));
+    };
+    auto dev_sym = [&](const char *name) -> void * {
+        return reinterpret_cast<void *>(gdpa(dev, name));
+    };
+    auto dev_sym_alt = [&](const char *a, const char *b) -> void * {
+        void *p = dev_sym(a);
+        return p ? p : dev_sym(b);
+    };
+    auto inst_sym_alt = [&](const char *a, const char *b) -> void * {
+        void *p = inst_sym(a);
+        return p ? p : inst_sym(b);
+    };
+
+    vf.vkGetPhysicalDeviceProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+        inst_sym("vkGetPhysicalDeviceProperties"));
+    vf.vkGetPhysicalDeviceMemoryProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
+        inst_sym("vkGetPhysicalDeviceMemoryProperties"));
+    vf.vkAllocateMemory = reinterpret_cast<PFN_vkAllocateMemory>(dev_sym("vkAllocateMemory"));
+    vf.vkFreeMemory = reinterpret_cast<PFN_vkFreeMemory>(dev_sym("vkFreeMemory"));
+    vf.vkMapMemory = reinterpret_cast<PFN_vkMapMemory>(dev_sym("vkMapMemory"));
+    vf.vkUnmapMemory = reinterpret_cast<PFN_vkUnmapMemory>(dev_sym("vkUnmapMemory"));
+    vf.vkFlushMappedMemoryRanges = reinterpret_cast<PFN_vkFlushMappedMemoryRanges>(dev_sym("vkFlushMappedMemoryRanges"));
+    vf.vkInvalidateMappedMemoryRanges = reinterpret_cast<PFN_vkInvalidateMappedMemoryRanges>(dev_sym("vkInvalidateMappedMemoryRanges"));
+    vf.vkBindBufferMemory = reinterpret_cast<PFN_vkBindBufferMemory>(dev_sym("vkBindBufferMemory"));
+    vf.vkBindImageMemory = reinterpret_cast<PFN_vkBindImageMemory>(dev_sym("vkBindImageMemory"));
+    vf.vkGetBufferMemoryRequirements = reinterpret_cast<PFN_vkGetBufferMemoryRequirements>(dev_sym("vkGetBufferMemoryRequirements"));
+    vf.vkGetImageMemoryRequirements = reinterpret_cast<PFN_vkGetImageMemoryRequirements>(dev_sym("vkGetImageMemoryRequirements"));
+    vf.vkCreateBuffer = reinterpret_cast<PFN_vkCreateBuffer>(dev_sym("vkCreateBuffer"));
+    vf.vkDestroyBuffer = reinterpret_cast<PFN_vkDestroyBuffer>(dev_sym("vkDestroyBuffer"));
+    vf.vkCreateImage = reinterpret_cast<PFN_vkCreateImage>(dev_sym("vkCreateImage"));
+    vf.vkDestroyImage = reinterpret_cast<PFN_vkDestroyImage>(dev_sym("vkDestroyImage"));
+    vf.vkCmdCopyBuffer = reinterpret_cast<PFN_vkCmdCopyBuffer>(dev_sym("vkCmdCopyBuffer"));
+
+#if VMA_DEDICATED_ALLOCATION || VMA_VULKAN_VERSION >= 1001000
+    vf.vkGetBufferMemoryRequirements2KHR = reinterpret_cast<PFN_vkGetBufferMemoryRequirements2KHR>(
+        dev_sym_alt("vkGetBufferMemoryRequirements2", "vkGetBufferMemoryRequirements2KHR"));
+    vf.vkGetImageMemoryRequirements2KHR = reinterpret_cast<PFN_vkGetImageMemoryRequirements2KHR>(
+        dev_sym_alt("vkGetImageMemoryRequirements2", "vkGetImageMemoryRequirements2KHR"));
+#endif
+#if VMA_BIND_MEMORY2 || VMA_VULKAN_VERSION >= 1001000
+    vf.vkBindBufferMemory2KHR = reinterpret_cast<PFN_vkBindBufferMemory2KHR>(
+        dev_sym_alt("vkBindBufferMemory2", "vkBindBufferMemory2KHR"));
+    vf.vkBindImageMemory2KHR = reinterpret_cast<PFN_vkBindImageMemory2KHR>(
+        dev_sym_alt("vkBindImageMemory2", "vkBindImageMemory2KHR"));
+#endif
+#if VMA_MEMORY_BUDGET || VMA_VULKAN_VERSION >= 1001000
+    vf.vkGetPhysicalDeviceMemoryProperties2KHR = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties2KHR>(
+        inst_sym_alt("vkGetPhysicalDeviceMemoryProperties2", "vkGetPhysicalDeviceMemoryProperties2KHR"));
+#endif
+#if VMA_KHR_MAINTENANCE4 || VMA_VULKAN_VERSION >= 1003000
+    vf.vkGetDeviceBufferMemoryRequirements = reinterpret_cast<PFN_vkGetDeviceBufferMemoryRequirementsKHR>(
+        dev_sym_alt("vkGetDeviceBufferMemoryRequirements", "vkGetDeviceBufferMemoryRequirementsKHR"));
+    vf.vkGetDeviceImageMemoryRequirements = reinterpret_cast<PFN_vkGetDeviceImageMemoryRequirementsKHR>(
+        dev_sym_alt("vkGetDeviceImageMemoryRequirements", "vkGetDeviceImageMemoryRequirementsKHR"));
+#endif
+
+    return vf;
+}
+
+static bool vita3k_lr_vma_required_functions_ok(const vma::VulkanFunctions &vf) {
+    return vf.vkGetPhysicalDeviceProperties && vf.vkGetPhysicalDeviceMemoryProperties && vf.vkAllocateMemory && vf.vkFreeMemory
+        && vf.vkMapMemory && vf.vkUnmapMemory && vf.vkFlushMappedMemoryRanges && vf.vkInvalidateMappedMemoryRanges
+        && vf.vkBindBufferMemory && vf.vkBindImageMemory && vf.vkGetBufferMemoryRequirements && vf.vkGetImageMemoryRequirements
+        && vf.vkCreateBuffer && vf.vkDestroyBuffer && vf.vkCreateImage && vf.vkDestroyImage && vf.vkCmdCopyBuffer;
+}
+
+static void lr_bootstrap_phase(const char *msg) {
+    LOG_INFO("[VITA3K-LR] {}", msg);
+#if defined(__APPLE__)
+    static os_log_t lr_oslog = os_log_create("org.vita3k", "Libretro");
+    os_log_info(lr_oslog, "%{public}s", msg);
+#endif
+}
+
+static bool vita3k_vk_bootstrap_from_libretro_negotiation(VKState &vk, const Config &config) {
+    (void)config;
+    const LibretroNegotiatedVulkan ng = libretro::negotiated_handles_get();
+    if (!ng.valid)
+        return false;
+
+    // RetroArch passes the loader entry point during negotiation; SDL has no Vulkan
+    // window in libretro mode, so SDL_Vulkan_GetVkGetInstanceProcAddr() is often NULL
+    // — using it caused DISPATCHER.init(nullptr) and a jump to address 0 in vk::* calls.
+    PFN_vkGetInstanceProcAddr ipa = ng.get_instance_proc_addr;
+    if (!ipa)
+        ipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(SDL_Vulkan_GetVkGetInstanceProcAddr());
+    if (!ipa) {
+        LOG_ERROR("Vita3K libretro: vkGetInstanceProcAddr is null (need RetroArch negotiation + non-null SDL Vulkan)");
+        return false;
+    }
+    VULKAN_HPP_DEFAULT_DISPATCHER.init(ipa);
+    VULKAN_HPP_DEFAULT_DISPATCHER.init(vk::Instance(ng.instance));
+
+    vk.instance = ng.instance;
+    vk.physical_device = ng.physical_device;
+    vk.device = ng.device;
+    vk.screen_renderer.surface = ng.surface;
+    vk.screen_renderer.window = nullptr;
+
+    vk.general_family_index = ng.general_family_index;
+    vk.transfer_family_index = ng.transfer_family_index;
+
+    vk.physical_device_properties = vk.physical_device.getProperties();
+    vk.physical_device_features = vk.physical_device.getFeatures();
+    vk.physical_device_memory = vk.physical_device.getMemoryProperties();
+    vk.physical_device_queue_families = vk.physical_device.getQueueFamilyProperties();
+
+    VULKAN_HPP_DEFAULT_DISPATCHER.init(vk.device);
+
+    vk.general_queue = vk.device.getQueue(vk.general_family_index, 0);
+    vk.transfer_queue = vk.device.getQueue(vk.transfer_family_index, 0);
+
+    vita3k_lr_ensure_wsi_swapchain_dispatch(ipa, ng.instance, ng.device);
+    if (!VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceSurfaceFormatsKHR
+        || !VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateSwapchainKHR) {
+        LOG_ERROR("[VITA3K-LR] WSI/swapchain dispatch null after vkGetDeviceProcAddr patch");
+        return false;
+    }
+    lr_bootstrap_phase("phase: device+queues+WSI OK");
+
+    bool support_dedicated_allocations = false;
+    bool temp_bool = false;
+    bool support_global_priority = false;
+    bool support_buffer_device_address = false;
+    bool support_external_memory = false;
+    bool support_shader_interlock = false;
+
+    const std::map<std::string_view, bool *> optional_extensions = {
+        { vk::KHRGetMemoryRequirements2ExtensionName, &temp_bool },
+        { vk::KHRDedicatedAllocationExtensionName, &support_dedicated_allocations },
+        { vk::EXTGlobalPriorityExtensionName, &support_global_priority },
+        { vk::KHRImageFormatListExtensionName, &vk.surface_cache.support_image_format_specifier },
+        { vk::KHRExternalMemoryExtensionName, &temp_bool },
+        { vk::KHRDeviceGroupExtensionName, &temp_bool },
+        { vk::EXTExternalMemoryHostExtensionName, &support_external_memory },
+        { vk::KHRBufferDeviceAddressExtensionName, &support_buffer_device_address },
+        { vk::KHRUniformBufferStandardLayoutExtensionName, &vk.support_standard_layout },
+        { vk::KHRShaderFloat16Int8ExtensionName, &vk.support_fsr },
+        { vk::EXTFragmentShaderInterlockExtensionName, &support_shader_interlock },
+#ifdef __APPLE__
+        { vk::KHRPortabilitySubsetExtensionName, &temp_bool },
+#endif
+        { VK_EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME, &vk.support_rasterized_order_access },
+#ifdef __ANDROID__
+        { VK_KHR_BIND_MEMORY_2_EXTENSION_NAME, &temp_bool },
+        { VK_KHR_SAMPLER_YCBCR_CONVERSION_EXTENSION_NAME, &temp_bool },
+        { VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME, &temp_bool },
+        { VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME, &vk.support_android_buffer_import },
+        { VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, &vk.support_unix_fd_import },
+#endif
+    };
+
+    for (const vk::ExtensionProperties &ext : vk.physical_device.enumerateDeviceExtensionProperties()) {
+        auto it = optional_extensions.find(ext.extensionName.data());
+        if (it != optional_extensions.end())
+            *it->second = true;
+    }
+
+#if defined(__APPLE__) && defined(LIBRETRO)
+    // MoltenVK + iOS libretro: do not call vkGetPhysicalDeviceFeatures2 / Features2KHR with extension
+    // pNext chains — we still see EXC_BAD_ACCESS here even when PFNs are non-null.
+    lr_bootstrap_phase("phase: Apple libretro — skip all PD feature2 / property2 KHR queries");
+    {
+        const std::string s = fmt::format(
+            "[VITA3K-LR] bootstrap (Apple libretro): ipa={} instance={} phys={} device={} surf={}",
+            reinterpret_cast<void *>(ipa), reinterpret_cast<void *>(ng.instance), reinterpret_cast<void *>(ng.physical_device),
+            reinterpret_cast<void *>(ng.device), reinterpret_cast<void *>(ng.surface));
+        LOG_INFO("{}", s);
+    }
+    support_buffer_device_address = false;
+    vk.support_standard_layout = false;
+    support_external_memory = false;
+    vk.support_fsr = false;
+    vk.support_rasterized_order_access = false;
+    support_shader_interlock = false;
+    vk.features.support_shader_interlock = false;
+    vk.supported_mapping_methods_mask = (1 << static_cast<int>(MappingMethod::Disabled));
+    vk.mapping_method = MappingMethod::Disabled;
+#else
+    // Vulkan-HPP: getFeatures2 uses vkGetPhysicalDeviceFeatures2; getFeatures2KHR uses
+    // vkGetPhysicalDeviceFeatures2KHR. getProperties2KHR uses vkGetPhysicalDeviceProperties2KHR.
+    // If the loader left any of these NULL, calls jump to address 0 (EXC_BAD_ACCESS).
+    PFN_vkGetPhysicalDeviceFeatures2 pfn_gpdf2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+        ipa(ng.instance, "vkGetPhysicalDeviceFeatures2"));
+    PFN_vkGetPhysicalDeviceFeatures2KHR pfn_gpdf2_khr = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2KHR>(
+        ipa(ng.instance, "vkGetPhysicalDeviceFeatures2KHR"));
+    const bool can_features2 = (pfn_gpdf2 != nullptr) || (pfn_gpdf2_khr != nullptr);
+
+    PFN_vkGetPhysicalDeviceProperties2 pfn_gpdpr2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+        ipa(ng.instance, "vkGetPhysicalDeviceProperties2"));
+    PFN_vkGetPhysicalDeviceProperties2KHR pfn_gpdpr2_khr = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2KHR>(
+        ipa(ng.instance, "vkGetPhysicalDeviceProperties2KHR"));
+    const bool can_properties2 = (pfn_gpdpr2 != nullptr) || (pfn_gpdpr2_khr != nullptr);
+
+    {
+        const std::string s = fmt::format(
+            "[VITA3K-LR] bootstrap: can_features2={} can_properties2={} ipa={} instance={} phys={} device={} surf={}",
+            can_features2, can_properties2, reinterpret_cast<void *>(ipa), reinterpret_cast<void *>(ng.instance),
+            reinterpret_cast<void *>(ng.physical_device), reinterpret_cast<void *>(ng.device), reinterpret_cast<void *>(ng.surface));
+        LOG_INFO("{}", s);
+#if defined(__APPLE__)
+        static os_log_t lr_diag = os_log_create("org.vita3k", "Libretro");
+        os_log_info(lr_diag, "%{public}s", s.c_str());
+#endif
+    }
+
+    if (!can_features2 || !can_properties2) {
+        const std::string w = fmt::format(
+            "[VITA3K-LR] PFN probe: missing query entry points (features2={} properties2={}); using conservative flags",
+            can_features2, can_properties2);
+        LOG_WARN("{}", w);
+#if defined(__APPLE__)
+        static os_log_t lr_diag = os_log_create("org.vita3k", "Libretro");
+        os_log_error(lr_diag, "%{public}s", w.c_str());
+#endif
+    }
+
+    if (!can_features2) {
+        support_buffer_device_address = false;
+        vk.support_standard_layout = false;
+        vk.support_fsr = false;
+        vk.support_rasterized_order_access = false;
+        support_shader_interlock = false;
+    }
+    if (!can_properties2)
+        support_external_memory = false;
+
+    if (can_features2) {
+        if (!VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceFeatures2 && pfn_gpdf2)
+            VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceFeatures2 = pfn_gpdf2;
+        if (!VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceFeatures2 && pfn_gpdf2_khr)
+            VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceFeatures2 =
+                reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(pfn_gpdf2_khr);
+        if (!VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceFeatures2KHR && pfn_gpdf2_khr)
+            VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceFeatures2KHR = pfn_gpdf2_khr;
+        if (!VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceFeatures2KHR && pfn_gpdf2)
+            VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceFeatures2KHR =
+                reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2KHR>(pfn_gpdf2);
+    }
+
+    if (can_properties2) {
+        if (!VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceProperties2 && pfn_gpdpr2)
+            VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceProperties2 = pfn_gpdpr2;
+        if (!VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceProperties2 && pfn_gpdpr2_khr)
+            VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceProperties2 =
+                reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(pfn_gpdpr2_khr);
+        if (!VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceProperties2KHR && pfn_gpdpr2_khr)
+            VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceProperties2KHR = pfn_gpdpr2_khr;
+        if (!VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceProperties2KHR && pfn_gpdpr2)
+            VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceProperties2KHR =
+                reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2KHR>(pfn_gpdpr2);
+    }
+
+    bool support_memory_mapping = true;
+    if (can_features2 && support_buffer_device_address) {
+        auto features = vk.physical_device.getFeatures2<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceBufferDeviceAddressFeatures>();
+        support_buffer_device_address &= static_cast<bool>(features.get<vk::PhysicalDeviceBufferDeviceAddressFeatures>().bufferDeviceAddress);
+    }
+    support_memory_mapping &= support_buffer_device_address;
+
+    if (can_features2 && vk.support_standard_layout) {
+        auto features = vk.physical_device.getFeatures2<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceUniformBufferStandardLayoutFeatures>();
+        vk.support_standard_layout &= static_cast<bool>(features.get<vk::PhysicalDeviceUniformBufferStandardLayoutFeatures>().uniformBufferStandardLayout);
+    }
+    support_memory_mapping &= vk.support_standard_layout;
+
+#ifdef __APPLE__
+    support_memory_mapping = false;
+#endif
+
+#ifdef __ANDROID__
+    vk.support_android_buffer_import &= SDL_GetAndroidSDKVersion() >= 26;
+    vk.support_unix_fd_import &= SDL_GetAndroidSDKVersion() >= 26;
+#endif
+
+    vk.supported_mapping_methods_mask = (1 << static_cast<int>(MappingMethod::Disabled));
+    if (support_memory_mapping) {
+        vk.mapping_method = MappingMethod::DoubleBuffer;
+        vk.supported_mapping_methods_mask |= (1 << static_cast<int>(MappingMethod::DoubleBuffer));
+        vk.supported_mapping_methods_mask |= (1 << static_cast<int>(MappingMethod::PageTable));
+
+        if (can_properties2 && support_external_memory) {
+            auto props = vk.physical_device.getProperties2KHR<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceExternalMemoryHostPropertiesEXT>();
+            support_external_memory = (props.get<vk::PhysicalDeviceExternalMemoryHostPropertiesEXT>().minImportedHostPointerAlignment <= 4096);
+        }
+
+        if (support_external_memory)
+            vk.supported_mapping_methods_mask |= (1 << static_cast<int>(MappingMethod::ExernalHost));
+
+#ifdef __ANDROID__
+        if (vk.support_android_buffer_import || vk.support_unix_fd_import)
+            vk.supported_mapping_methods_mask |= (1 << static_cast<int>(MappingMethod::NativeBuffer));
+#endif
+    }
+
+    vk.support_fsr &= static_cast<bool>(vk.physical_device_features.shaderInt16);
+    if (can_features2 && vk.support_fsr) {
+        auto props = vk.physical_device.getFeatures2KHR<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceShaderFloat16Int8Features>();
+        vk.support_fsr = static_cast<bool>(props.get<vk::PhysicalDeviceShaderFloat16Int8Features>().shaderFloat16);
+    }
+
+    if (can_features2 && vk.support_rasterized_order_access) {
+        auto props = vk.physical_device.getFeatures2KHR<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT>();
+        vk.support_rasterized_order_access = static_cast<bool>(props.get<vk::PhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT>().rasterizationOrderColorAttachmentAccess);
+        support_shader_interlock = false;
+    }
+
+    support_shader_interlock &= static_cast<bool>(vk.physical_device_features.fragmentStoresAndAtomics);
+    if (can_features2 && support_shader_interlock) {
+        auto props = vk.physical_device.getFeatures2KHR<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT>();
+        support_shader_interlock = static_cast<bool>(props.get<vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT>().fragmentShaderSampleInterlock);
+        vk.features.support_shader_interlock = support_shader_interlock;
+    }
+#endif // !(__APPLE__ && LIBRETRO)
+
+    if (vk.physical_device_properties.vendorID == 4318)
+        support_global_priority = false;
+
+    // Command pools — same as generic create() tail.
+    {
+        vk::CommandPoolCreateInfo general_pool_info{
+            .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
+            .queueFamilyIndex = vk.general_family_index
+        };
+
+        vk::CommandPoolCreateInfo transfer_pool_info{
+            .flags = vk::CommandPoolCreateFlagBits::eTransient,
+            .queueFamilyIndex = vk.transfer_family_index
+        };
+
+        vk.general_command_pool = vk.device.createCommandPool(general_pool_info);
+        vk.transfer_command_pool = vk.device.createCommandPool(transfer_pool_info);
+
+        general_pool_info.flags |= vk::CommandPoolCreateFlagBits::eTransient;
+        vk.multithread_command_pool = vk.device.createCommandPool(general_pool_info);
+    }
+    lr_bootstrap_phase("phase: command pools OK");
+
+    vita3k_lr_ensure_device_command_dispatch(ipa, ng.instance, ng.device);
+    lr_bootstrap_phase("phase: device command + memory PFNs patched (pre-VMA)");
+
+    vma::VulkanFunctions vulkan_functions = vita3k_lr_build_vma_vulkan_functions(
+        ipa, static_cast<VkInstance>(vk.instance), static_cast<VkDevice>(vk.device));
+    if (!vulkan_functions.vkGetInstanceProcAddr || !vulkan_functions.vkGetDeviceProcAddr
+        || !vita3k_lr_vma_required_functions_ok(vulkan_functions)) {
+        LOG_ERROR("[VITA3K-LR] VMA: failed to resolve required Vulkan function pointers (ipa/gdpa)");
+        return false;
+    }
+
+    bool vma_use_dedicated = support_dedicated_allocations;
+#if defined(__APPLE__) && defined(LIBRETRO)
+    // MoltenVK: dedicated image allocations have been observed to fail with VK_ERROR_INITIALIZATION_FAILED
+    // during first GXM texture create after HW context negotiation on some titles/devices.
+    vma_use_dedicated = false;
+#endif
+#if VMA_DEDICATED_ALLOCATION || VMA_VULKAN_VERSION >= 1001000
+    if (vma_use_dedicated
+        && (!vulkan_functions.vkGetBufferMemoryRequirements2KHR || !vulkan_functions.vkGetImageMemoryRequirements2KHR)) {
+        LOG_WARN("[VITA3K-LR] VMA: KHR dedicated allocation requested but vkGet*MemoryRequirements2 is null; disabling eKhrDedicatedAllocation");
+        vma_use_dedicated = false;
+    }
+#endif
+
+    {
+        vma::AllocatorCreateInfo allocator_info = {
+            .flags = vma::AllocatorCreateFlagBits::eExternallySynchronized,
+            .physicalDevice = vk.physical_device,
+            .device = vk.device,
+            .pVulkanFunctions = &vulkan_functions,
+            .instance = vk.instance,
+            .vulkanApiVersion = VK_API_VERSION_1_0,
+        };
+
+        if (vma_use_dedicated)
+            allocator_info.flags |= vma::AllocatorCreateFlagBits::eKhrDedicatedAllocation;
+
+        if (vk.supported_mapping_methods_mask > 1)
+            allocator_info.flags |= vma::AllocatorCreateFlagBits::eBufferDeviceAddress;
+
+        vk.allocator = vma::createAllocator(allocator_info);
+        vkutil::init(vk.allocator);
+    }
+    lr_bootstrap_phase("phase: VMA allocator OK");
+
+    {
+        vk.default_buffer = vkutil::Buffer(KiB(4));
+        vk.default_buffer.init_buffer(vk::BufferUsageFlagBits::eVertexBuffer);
+        lr_bootstrap_phase("phase: default buffer (VMA first alloc) OK");
+
+        vk.default_image = vkutil::Image(1, 1, vk::Format::eR8G8B8A8Unorm);
+
+        vk.default_image.init_image(vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst);
+        lr_bootstrap_phase("phase: default image + view OK");
+
+        vk::CommandBuffer cmd_buffer = vkutil::create_single_time_command(vk.device, vk.general_command_pool);
+        lr_bootstrap_phase("phase: single-time command recording");
+        vk.default_image.transition_to(cmd_buffer, vkutil::ImageLayout::TransferDst);
+        vk::ClearColorValue white{
+            .float32 = std::array<float, 4>{ 1.0f, 1.0f, 1.0f, 1.0f }
+        };
+        cmd_buffer.clearColorImage(vk.default_image.image, vk::ImageLayout::eTransferDstOptimal, white, vkutil::color_subresource_range);
+        vk.default_image.transition_to(cmd_buffer, vkutil::ImageLayout::StorageImage);
+        vkutil::end_single_time_command(vk.device, vk.general_queue, vk.general_command_pool, cmd_buffer);
+        lr_bootstrap_phase("phase: default image upload + submit OK");
+
+        vk::SamplerCreateInfo sampler_info{
+            .magFilter = vk::Filter::eLinear,
+            .minFilter = vk::Filter::eLinear,
+            .mipmapMode = vk::SamplerMipmapMode::eLinear,
+            .addressModeU = vk::SamplerAddressMode::eRepeat,
+            .addressModeV = vk::SamplerAddressMode::eRepeat,
+            .addressModeW = vk::SamplerAddressMode::eRepeat,
+            .minLod = 0.0f,
+            .maxLod = 0.0f,
+        };
+        vk.default_image.sampler = vk.device.createSampler(sampler_info);
+    }
+    lr_bootstrap_phase("phase: default buffer + image OK");
+
+    for (int i = 0; i < MAX_FRAMES_RENDERING; i++) {
+        FrameObject &frame = vk.frames[i];
+
+        vk::CommandPoolCreateInfo pool_info{
+            .queueFamilyIndex = vk.general_family_index
+        };
+
+        frame.render_pool = vk.device.createCommandPool(pool_info);
+        pool_info.flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
+        frame.prerender_pool = vk.device.createCommandPool(pool_info);
+
+        frame.destroy_queue.init(vk.device);
+    }
+    lr_bootstrap_phase("phase: per-frame pools OK — entering screen_renderer.setup()");
+
+    vk.screen_renderer.libretro_hw_surface = true;
+    if (!vk.screen_renderer.setup())
+        return false;
+
+    vk.support_fsr &= static_cast<bool>(vk.screen_renderer.surface_capabilities.supportedUsageFlags & vk::ImageUsageFlagBits::eStorage);
+
+    return true;
+}
+
+} // namespace
+#endif
+
 bool VKState::create(SDL_Window *window, std::unique_ptr<renderer::State> &state, const Config &config) {
+#ifdef LIBRETRO
+    if (!window) {
+        if (!vita3k_vk_bootstrap_from_libretro_negotiation(*this, config)) {
+            LOG_ERROR("Vita3K libretro: failed to bootstrap Vulkan from negotiated handles");
+            return false;
+        }
+        return true;
+    }
+#endif
     // Create Instance
     {
         PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(SDL_Vulkan_GetVkGetInstanceProcAddr());
@@ -996,6 +1556,74 @@ void VKState::render_frame(const SceFVector2 &viewport_pos, const SceFVector2 &v
     if (!screen_renderer.acquire_swapchain_image())
         return;
 
+#ifdef LIBRETRO
+    const uint32_t max_dim = physical_device_properties.limits.maxImageDimension2D;
+    const auto safe_display_dim = [max_dim](SceInt v) -> uint32_t {
+        if (v <= 0)
+            return 1u;
+
+        return vkutil::clamp_image_extent_component(static_cast<uint32_t>(v), max_dim);
+    };
+
+    const uint32_t img_w = safe_display_dim(frame.image_size.x);
+    const uint32_t img_h = safe_display_dim(frame.image_size.y);
+
+    // Check if the surface exists
+    Viewport viewport;
+    viewport.width = vkutil::clamp_image_extent_component(static_cast<uint32_t>(static_cast<float>(img_w) * res_multiplier), max_dim);
+    viewport.height = vkutil::clamp_image_extent_component(static_cast<uint32_t>(static_cast<float>(img_h) * res_multiplier), max_dim);
+
+    vk::ImageLayout layout = vk::ImageLayout::eGeneral;
+    vk::ImageView surface_handle = surface_cache.sourcing_color_surface_for_presentation(
+        frame.base, frame.pitch, viewport);
+
+    if (!surface_handle) {
+        vkutil::Image &vita_surface = screen_renderer.vita_surface[screen_renderer.swapchain_image_idx];
+        if (img_w != vita_surface.width || img_h != vita_surface.height) {
+            // re-create the image
+            vita_surface.destroy();
+            vita_surface = vkutil::Image(img_w, img_h, vk::Format::eR8G8B8A8Unorm);
+            vita_surface.init_image(vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst);
+        }
+
+        // copy surface to staging buffer
+        const vk::DeviceSize texture_data_size = static_cast<vk::DeviceSize>(frame.pitch) * static_cast<vk::DeviceSize>(img_h) * 4u;
+        if (texture_data_size > VITA_DISPLAY_FRAMEBUFFER_MAX_BYTES) {
+            LOG_ERROR("render_frame: display copy size {} exceeds host staging cap ({}×{} pitch {})",
+                texture_data_size, img_w, img_h, frame.pitch);
+            return;
+        }
+        memcpy(screen_renderer.vita_surface_staging_info.pMappedData, frame.base.get(mem), static_cast<size_t>(texture_data_size));
+
+        // copy staging buffer to image
+        auto &cmd_buffer = screen_renderer.current_cmd_buffer;
+        vita_surface.transition_to_discard(cmd_buffer, vkutil::ImageLayout::TransferDst);
+        vk::BufferImageCopy region{
+            .bufferOffset = 0,
+            .bufferRowLength = frame.pitch,
+            .bufferImageHeight = img_h,
+            .imageSubresource = vkutil::color_subresource_layer,
+            .imageOffset = { 0, 0, 0 },
+            .imageExtent = { img_w, img_h, 1 }
+        };
+        cmd_buffer.copyBufferToImage(screen_renderer.vita_surface_staging, vita_surface.image, vk::ImageLayout::eTransferDstOptimal, region);
+
+        vita_surface.transition_to(cmd_buffer, vkutil::ImageLayout::SampledImage);
+
+        surface_handle = vita_surface.view;
+        viewport = {
+            .offset_x = 0,
+            .offset_y = 0,
+            .width = img_w,
+            .height = img_h,
+            .texture_width = img_w,
+            .texture_height = img_h
+        };
+        layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+    }
+
+    screen_renderer.render(surface_handle, layout, viewport);
+#else
     // Check if the surface exists
     Viewport viewport;
     viewport.width = static_cast<uint32_t>(frame.image_size.x * res_multiplier);
@@ -1015,8 +1643,13 @@ void VKState::render_frame(const SceFVector2 &viewport_pos, const SceFVector2 &v
         }
 
         // copy surface to staging buffer
-        const vk::DeviceSize texture_data_size = frame.pitch * frame.image_size.y * 4;
-        memcpy(screen_renderer.vita_surface_staging_info.pMappedData, frame.base.get(mem), texture_data_size);
+        const vk::DeviceSize texture_data_size = static_cast<vk::DeviceSize>(frame.pitch) * static_cast<vk::DeviceSize>(frame.image_size.y) * 4u;
+        if (texture_data_size > VITA_DISPLAY_FRAMEBUFFER_MAX_BYTES) {
+            LOG_ERROR("render_frame: display copy size {} exceeds host staging cap ({}×{} pitch {})",
+                texture_data_size, frame.image_size.x, frame.image_size.y, frame.pitch);
+            return;
+        }
+        memcpy(screen_renderer.vita_surface_staging_info.pMappedData, frame.base.get(mem), static_cast<size_t>(texture_data_size));
 
         // copy staging buffer to image
         auto &cmd_buffer = screen_renderer.current_cmd_buffer;
@@ -1046,6 +1679,7 @@ void VKState::render_frame(const SceFVector2 &viewport_pos, const SceFVector2 &v
     }
 
     screen_renderer.render(surface_handle, layout, viewport);
+#endif
 }
 
 void VKState::swap_window(SDL_Window *window) {

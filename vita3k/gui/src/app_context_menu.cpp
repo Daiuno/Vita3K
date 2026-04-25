@@ -17,6 +17,10 @@
 
 #include "private.h"
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
 #include <config/state.h>
 #include <config/version.h>
 #include <dialog/state.h>
@@ -650,17 +654,20 @@ void open_path(const std::string &path) {
     if (path.starts_with("http")) {
         SDL_OpenURL(path.c_str());
     } else {
-#ifdef _WIN32
+#if defined(__APPLE__) && TARGET_OS_IOS
+        // system() is unavailable on iOS — opening external URLs/paths from
+        // the in-emulator overlay is not supported in the libretro build.
+        (void)path;
+#elif defined(_WIN32)
         static const char OS_PREFIX[] = "start \"Vita3K\" ";
-#elif __APPLE__
+        system((OS_PREFIX + ("\"" + path + "\"")).c_str());
+#elif defined(__APPLE__)
         static const char OS_PREFIX[] = "open ";
+        system((OS_PREFIX + ("\"" + path + "\"")).c_str());
 #else
         static const char OS_PREFIX[] = "xdg-open ";
         system((OS_PREFIX + ("\"" + path + "\" & disown")).c_str());
-        return;
 #endif
-
-        system((OS_PREFIX + ("\"" + path + "\"")).c_str());
     }
 }
 

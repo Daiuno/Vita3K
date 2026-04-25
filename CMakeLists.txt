@@ -7,6 +7,17 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Android")
 	include("cmake/vcpkg_android.cmake")
 endif()
 
+# ---------------------------------------------------------------------------
+# Libretro-core switch.
+#
+# Pass -DLIBRETRO=ON to build the Vita3K libretro shared library
+# (vita3k_libretro.dylib / .so / .dll) linked against the full engine.
+# The standalone frontend executable is not built in that mode.
+#
+# Source code uses `#ifdef LIBRETRO` (CMake adds LIBRETRO=1 when LIBRETRO=ON).
+# ---------------------------------------------------------------------------
+option(LIBRETRO "Build the Vita3K libretro core only" OFF)
+
 project(Vita3K)
 
 # Detects the amount of processors of the host machine and forwards the result to CPU_COUNT
@@ -19,7 +30,10 @@ include("external/dynarmic/CMakeModules/DetectArchitecture.cmake")
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-set(CMAKE_OSX_DEPLOYMENT_TARGET 11.0)
+if(NOT IOS)
+    # Don't override an iOS toolchain's deployment target.
+    set(CMAKE_OSX_DEPLOYMENT_TARGET 11.0)
+endif()
 
 # workaround for SDL due to cmake bug 
 # https://github.com/libsdl-org/SDL/issues/6454
@@ -45,7 +59,7 @@ if(ANDROID)
 		set(CMAKE_VISIBILITY_INLINES_HIDDEN 1)
 	endif()
 else()
-	if((ARCHITECTURE STREQUAL "x86_64") OR APPLE)
+	if(((ARCHITECTURE STREQUAL "x86_64") OR APPLE) AND NOT IOS)
 		option(USE_DISCORD_RICH_PRESENCE "Build Vita3K with Discord Rich Presence" ON)
 	endif()
 	option(BUILD_APPIMAGE "Build an AppImage." OFF)
@@ -144,12 +158,29 @@ macro(boost_compile)
 			WORKING_DIRECTORY ${BOOST_SOURCEDIR}
 			OUTPUT_QUIET
 		)
-	elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-		execute_process(
-			COMMAND ${b2_cmd_line_common} architecture=${BOOST_ARCHITECTURE} cxxflags="-mmacosx-version-min=11.0" stage
-			WORKING_DIRECTORY ${BOOST_SOURCEDIR}
-			OUTPUT_QUIET
-		)
+	elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
+		if(IOS)
+			# Generate a user-config to point b2 at the iOS SDK / deployment target
+			set(_ios_user_cfg "${CMAKE_BINARY_DIR}/boost-ios-user-config.jam")
+			file(WRITE "${_ios_user_cfg}"
+				"using clang-darwin : iphone\n"
+				"  : ${CMAKE_CXX_COMPILER}\n"
+				"  : <compileflags>\"-arch arm64 -isysroot ${CMAKE_IOS_SDK_ROOT} -miphoneos-version-min=${IPHONEOS_DEPLOYMENT_TARGET} -fvisibility=hidden -fembed-bitcode=marker\"\n"
+				"    <striper>\n"
+				"    <linker-type>darwin\n"
+				"  ;\n"
+			)
+			execute_process(
+				COMMAND ${b2_cmd_line_common} --user-config=${_ios_user_cfg} toolset=clang-darwin-iphone architecture=arm target-os=iphone address-model=64 link=static threading=multi variant=release stage
+				WORKING_DIRECTORY ${BOOST_SOURCEDIR}
+			)
+		else()
+			execute_process(
+				COMMAND ${b2_cmd_line_common} architecture=${BOOST_ARCHITECTURE} cxxflags="-mmacosx-version-min=11.0" stage
+				WORKING_DIRECTORY ${BOOST_SOURCEDIR}
+				OUTPUT_QUIET
+			)
+		endif()
 	elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 		execute_process(
 			COMMAND ${b2_cmd_line_common} --ignore-site-config toolset=${BOOST_TOOLSET} stage
@@ -265,6 +296,13 @@ endmacro(get_boost)
 
 get_boost()
 
+# When building as a libretro core, advertise it globally so that Vita3K
+# subsystems (app/renderer/audio/...) can conditionally compile out the
+# bits that depend on a real SDL window / host main loop.
+if(LIBRETRO)
+    add_compile_definitions(LIBRETRO=1)
+endif()
+
 if(WIN32)
 	add_compile_definitions("_SILENCE_ALL_CXX17_DEPRECATION_WARNINGS" "_CRT_SECURE_NO_WARNINGS" "NOMINMAX")
 
@@ -294,4 +332,13 @@ endif()
 
 add_subdirectory(external)
 add_subdirectory(vita3k)
-add_subdirectory(tools/gen-modules)
+
+# Tools (gen-modules) are host-only; skip on cross-compile.
+if(NOT IOS AND NOT ANDROID)
+    add_subdirectory(tools/gen-modules)
+endif()
+
+if(LIBRETRO)
+    message(STATUS "Vita3K: building LIBRETRO core")
+    add_subdirectory(libretro)
+endif()

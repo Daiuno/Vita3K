@@ -326,6 +326,16 @@ bool init(EmuEnvState &state, Config &cfg, const Root &root_paths) {
     ImGuiIO &io = ImGui::GetIO();
     io.IniFilename = NULL;
 
+#ifdef LIBRETRO
+    // Libretro core: the frontend (RetroArch) owns the window.  We skip
+    // SDL_CreateWindow entirely and let the renderer be wired up later
+    // through `retro_hw_render_callback` (see libretro_vulkan_context.cpp).
+    (void)root_paths; // not used here on libretro path
+    state.manual_dpi_scale = 1.0f;
+    state.system_dpi_scale = 1.0f;
+    state.window_size = { DEFAULT_RES_WIDTH, DEFAULT_RES_HEIGHT };
+    state.drawable_size = { DEFAULT_RES_WIDTH, DEFAULT_RES_HEIGHT };
+#else
     int window_type = 0;
     switch (state.backend_renderer) {
     case renderer::Backend::OpenGL:
@@ -393,6 +403,7 @@ bool init(EmuEnvState &state, Config &cfg, const Root &root_paths) {
             return false;
         }
     }
+#endif // LIBRETRO
 
     if (!init(state.io, state.cache_path, state.log_path, state.pref_path, state.cfg.console)) {
         LOG_ERROR("Failed to initialize file system for the emulator!");
@@ -415,11 +426,30 @@ bool init(EmuEnvState &state, Config &cfg, const Root &root_paths) {
 }
 
 bool late_init(EmuEnvState &state) {
+#ifdef LIBRETRO
+    // Renderer (Vulkan/MoltenVK) is created later via retro_hw_render; we cannot
+    // call renderer->late_init before mem::init like the standalone build does.
+    //
+    // Standalone sets need_page_table only when mapping_method is PageTable or
+    // NativeBuffer; for MoltenVK on Apple, memory mapping is Disabled and Dynarmic
+    // uses fastmem — matching that avoids incorrect guest translation on host ARM64
+    // (was: forced page table → crashes in ThreadState::run_loop / EXC_BAD_ACCESS at
+    // the guest arena base, e.g. 0x400000000).
+#if defined(__APPLE__)
+    const bool need_page_table = false;
+    LOG_INFO("Vita3K libretro: mem init need_page_table=false (Apple — matches desktop Vulkan fastmem / MoltenVK)");
+#else
+    // Non-Apple libretro (e.g. Linux/Android): keep conservative page table until
+    // a renderer-driven init order exists.
+    const bool need_page_table = true;
+#endif
+#else
     // note: mem is not initialized yet but that's not an issue
     // the renderer is not using it yet, just storing it for later uses
     state.renderer->late_init(state.cfg, state.app_path, state.mem);
 
     const bool need_page_table = state.renderer->mapping_method == MappingMethod::PageTable || state.renderer->mapping_method == MappingMethod::NativeBuffer;
+#endif
     if (!init(state.mem, need_page_table)) {
         LOG_ERROR("Failed to initialize memory for emulator state!");
         return false;

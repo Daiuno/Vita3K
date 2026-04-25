@@ -42,7 +42,51 @@
 
 #include <util/fs.h>
 
+#ifdef LIBRETRO
+#include <algorithm>
+#include <cstdint>
+#include <vulkan/vulkan_format_traits.hpp>
+#endif
+
 namespace vkutil {
+
+#ifdef LIBRETRO
+// Libretro / MoltenVK: 0 / UINT32_MAX (often signed -1 or garbage) must not reach vkCreateImage.
+inline uint32_t clamp_image_extent_component(uint32_t dim, uint32_t max_image_dimension_2d) {
+    if (dim == 0 || dim == UINT32_MAX)
+        return 1u;
+    // Guest sometimes leaves 0xFFFFFFFE etc.; treat as invalid.
+    if (dim >= UINT32_MAX - 1u)
+        return 1u;
+
+    return std::min(dim, max_image_dimension_2d);
+}
+
+// MoltenVK: compressed optimal images must use block-aligned extents (shared by texture cache + vkutil::Image).
+inline void clamp_image_extent_to_block_grid(uint32_t &width, uint32_t &height, vk::Format fmt, uint32_t max_dim) {
+    const auto be = vk::blockExtent(fmt);
+    const uint32_t bx = std::max(1u, static_cast<uint32_t>(be[0]));
+    const uint32_t by = std::max(1u, static_cast<uint32_t>(be[1]));
+    if (bx <= 1 && by <= 1)
+        return;
+
+    auto round_up = [](uint32_t v, uint32_t a) { return (v + a - 1u) / a * a; };
+    auto round_down = [](uint32_t v, uint32_t a) { return (v / a) * a; };
+
+    uint32_t w = round_up(width, bx);
+    uint32_t h = round_up(height, by);
+    if (w > max_dim)
+        w = round_down(max_dim, bx);
+    if (h > max_dim)
+        h = round_down(max_dim, by);
+    if (w == 0 || w < bx)
+        w = std::min(bx, max_dim);
+    if (h == 0 || h < by)
+        h = std::min(by, max_dim);
+    width = std::max(1u, w);
+    height = std::max(1u, h);
+}
+#endif // LIBRETRO
 
 static constexpr vk::ImageSubresourceRange color_subresource_range = {
     .aspectMask = vk::ImageAspectFlagBits::eColor,

@@ -27,6 +27,8 @@
 #include <util/log.h>
 #include <util/overloaded.h>
 
+#include <algorithm>
+
 namespace renderer::vulkan {
 
 void VKContext::wait_thread_function(const MemState &mem) {
@@ -141,10 +143,18 @@ void set_context(VKContext &context, MemState &mem, VKRenderTarget *rt, const Fe
     }
     context.current_color_format = vk_format;
 
-    if (rt->multisample_mode && !context.record.color_surface.downscale) {
-        // using MSAA without downscaling, emulate this as best as we can by multiplying the width and height of the render target by 2
-        rt->width *= 2;
-        rt->height *= 2;
+    // Effective RT size for drawing: derive from the backing color image every time. The old path
+    // mutated rt->width/height with *=2 on each set_context when MSAA && !downscale; repeated
+    // set_context before submit could wrap uint16_t (e.g. 32768*2 -> 0), breaking viewport/scissor.
+    {
+        uint32_t eff_w = rt->color.width;
+        uint32_t eff_h = rt->color.height;
+        if (rt->multisample_mode && !context.record.color_surface.downscale) {
+            eff_w *= 2;
+            eff_h *= 2;
+        }
+        rt->width = static_cast<uint16_t>(std::min<uint32_t>(eff_w, 65535u));
+        rt->height = static_cast<uint16_t>(std::min<uint32_t>(eff_h, 65535u));
     }
 
     SceGxmDepthStencilSurface *ds_surface_fin = &context.record.depth_stencil_surface;
@@ -456,11 +466,9 @@ void VKContext::stop_recording(const SceGxmNotification &notif1, const SceGxmNot
     if (!submit)
         return;
 
-    if (render_target->multisample_mode && !record.color_surface.downscale) {
-        // revert changes made in set_context
-        render_target->width /= 2;
-        render_target->height /= 2;
-    }
+    // Restore canonical dimensions from the color image (replaces fragile /=2 pairing with *=2 in set_context).
+    render_target->width = static_cast<uint16_t>(std::min<uint32_t>(render_target->color.width, 65535u));
+    render_target->height = static_cast<uint16_t>(std::min<uint32_t>(render_target->color.height, 65535u));
 
     vk::Fence fence = next_fence;
     next_fence = nullptr;

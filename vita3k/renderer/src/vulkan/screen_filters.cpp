@@ -513,8 +513,13 @@ void FSRScreenFilter::on_resize() {
     const bool fullscreen_hd_res_pixel_perfect_en = screen.state.fullscreen_hd_res_pixel_perfect & screen.state.fullscreen & !(screen.extent.width % DEFAULT_RES_WIDTH) & !(screen.extent.height % (DEFAULT_RES_HEIGHT - 4));
     if (screen.state.stretch_the_display_area && !fullscreen_hd_res_pixel_perfect_en) {
         // Match the aspect ratio to the screen size.
+#ifdef LIBRETRO
+        output_size.width = screen.extent.width;
+        output_size.height = screen.extent.height;
+#else
         output_size.width = static_cast<float>(screen.extent.width);
         output_size.height = static_cast<float>(screen.extent.height);
+#endif
         output_offset.width = 0.0f;
         output_offset.height = 0.0f;
     } else if ((window_aspect > vita_aspect) && !fullscreen_hd_res_pixel_perfect_en) {

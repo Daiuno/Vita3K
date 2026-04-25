@@ -67,6 +67,10 @@
 #include <renderer/vulkan/state.h>
 #include <vkutil/vkutil.h>
 
+#ifdef LIBRETRO
+#include <vkutil/vma_libretro.h>
+#endif
+
 #include <util/log.h>
 
 // Visual Studio warnings
@@ -617,7 +621,14 @@ IMGUI_API ImTextureID ImGui_ImplSdlVulkan_CreateTexture(ImGui_VulkanState &state
         .initialLayout = vk::ImageLayout::eUndefined
     };
 
+#ifdef LIBRETRO
+    {
+        const uint32_t seq = vkutil::next_vkutil_vma_seq();
+        vkutil::libretro_vma_create_image(vk_state.allocator, image_info, "imgui_ImplSdlVulkan_CreateTexture", seq, texture->image, texture->allocation, nullptr);
+    }
+#else
     std::tie(texture->image, texture->allocation) = vk_state.allocator.createImage(image_info, vkutil::vma_auto_alloc);
+#endif
 
     vk::CommandBuffer transfer_buffer = vkutil::create_single_time_command(vk_state.device,
         vk_state.transfer_command_pool);

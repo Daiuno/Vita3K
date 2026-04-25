@@ -17,8 +17,13 @@
 
 #include <audio/state.h>
 
+#ifndef VITA3K_NO_CUBEB
 #include <audio/impl/cubeb_audio.h>
+#endif
 #include <audio/impl/sdl_audio.h>
+#ifdef LIBRETRO
+#include <audio/impl/libretro_audio.h>
+#endif
 
 #include <util/log.h>
 
@@ -42,8 +47,16 @@ void AudioState::set_backend(const std::string &adapter_name) {
     adapter.reset();
     if (adapter_name == "SDL") {
         adapter = std::make_unique<SDLAudioAdapter>(*this);
+#ifndef VITA3K_NO_CUBEB
     } else if (adapter_name == "Cubeb") {
         adapter = std::make_unique<CubebAudioAdapter>(*this);
+#endif
+#ifdef LIBRETRO
+    } else if (adapter_name == "Libretro") {
+        // Routes per-port PCM into a sink registered by the libretro
+        // core (see vita3k/audio/include/audio/impl/libretro_audio.h).
+        adapter = std::make_unique<LibretroAudioAdapter>(*this);
+#endif
     } else {
         LOG_ERROR("Unknown audio adapter {}", adapter_name);
         return;

@@ -21,7 +21,21 @@
 #include <util/bit_cast.h>
 #include <util/log.h>
 
+#include <mem/functions.h>
 #include <mem/ptr.h>
+
+#ifdef LIBRETRO
+#include <mem/util.h>
+
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#include <os/log.h>
+#endif
+#endif
 
 #include <dynarmic/frontend/A32/a32_ir_emitter.h>
 #include <dynarmic/interface/A32/coprocessor.h>
@@ -30,6 +44,71 @@
 #include <memory>
 #include <optional>
 #include <string>
+
+#ifdef LIBRETRO
+namespace {
+
+std::atomic<uint32_t> g_lr_memwrite_trace_seq{0};
+
+static bool libretro_memwrite_trace_env_enabled() {
+    static std::atomic<int> cached{ -1 };
+    int c = cached.load(std::memory_order_relaxed);
+    if (c != -1)
+        return c != 0;
+    const char *const e = std::getenv("VITA3K_LR_TRACE_MEMWRITE");
+    const bool on = e && e[0] != '\0' && std::strcmp(e, "0") != 0;
+    cached.store(on ? 1 : 0, std::memory_order_relaxed);
+    return on;
+}
+
+// Optional diagnostic: set VITA3K_LR_TRACE_MEMWRITE=1 to sample pre-store info (iOS mprotect / protect debugging).
+// Default off: with fastmem disabled, MemoryWrite runs very often; LOG_ERROR here stalls the core.
+void libretro_trace_memwrite_before_store(const MemState &mem, Address a, uint32_t sz, const void *host_ptr, uint32_t pc) {
+    if (!libretro_memwrite_trace_env_enabled())
+        return;
+
+    const uint32_t seq = ++g_lr_memwrite_trace_seq;
+    const bool sample = (seq <= 64u) || ((seq % 65536u) == 1u);
+    if (!sample)
+        return;
+
+    const uint32_t start_page = a / mem.page_size;
+    const uint32_t end_page = (a + sz + mem.page_size - 1u) / mem.page_size;
+    const uintptr_t host = reinterpret_cast<uintptr_t>(host_ptr);
+    const uint32_t idx0 = static_cast<uint32_t>(a / KiB(4));
+    const uint32_t idx1 = static_cast<uint32_t>((static_cast<uint64_t>(a) + sz - 1ull) / KiB(4));
+    uintptr_t pt0 = 0;
+    uintptr_t pt1 = 0;
+    if (mem.use_page_table && mem.page_table) {
+        pt0 = reinterpret_cast<uintptr_t>(mem.page_table[idx0]);
+        pt1 = reinterpret_cast<uintptr_t>(mem.page_table[idx1]);
+    }
+    const uintptr_t base = reinterpret_cast<uintptr_t>(mem.memory.get());
+    const bool in_main_vm = (host >= base) && (host + sz <= base + GiB(4));
+    const bool range_ok = is_valid_addr_range(mem, a, a + sz);
+
+    LOG_TRACE("[VITA3K-LR] MemWrite pre-store seq={} guest=[0x{:x},0x{:x}) sz={} host=0x{:x} arm_pc=0x{:x} range_ok={} "
+        "guest_pages=[{},{}] pt={} pt0=0x{:x} pt1=0x{:x} in_main_vm={} host_ps={} guest_ps={}",
+        seq, a, a + sz, sz, host, pc, range_ok,
+        start_page, end_page, mem.use_page_table, pt0, pt1, in_main_vm,
+        mem.host_page_size, mem.page_size);
+
+    if (seq <= 16u) {
+        std::fprintf(stderr, "[VITA3K-LR] MemWrite pre-store seq=%u guest=0x%x host=0x%llx arm_pc=0x%x range_ok=%d\n",
+            seq, a, static_cast<unsigned long long>(host), pc, range_ok ? 1 : 0);
+        std::fflush(stderr);
+    }
+#if defined(__APPLE__)
+    if (seq <= 16u) {
+        static os_log_t os_lr = os_log_create("com.vita3k.libretro", "MemWrite");
+        os_log_with_type(os_lr, OS_LOG_TYPE_DEBUG, "[VITA3K-LR] MemWrite trace seq=%u guest=0x%x host=0x%llx arm_pc=0x%x",
+            seq, a, static_cast<unsigned long long>(host), pc);
+    }
+#endif
+}
+
+} // namespace
+#endif
 
 class ArmDynarmicCP15 : public Dynarmic::A32::Coprocessor {
     uint32_t tpidruro;
@@ -130,7 +209,9 @@ public:
     template <typename T>
     T MemoryRead(Dynarmic::A32::VAddr addr) {
         Ptr<T> ptr{ addr };
-        if (!ptr || !ptr.valid(*parent->mem) || ptr.address() < parent->mem->page_size) {
+        const Address a = ptr.address();
+        const Address range_end = a + sizeof(T);
+        if (!ptr || a < parent->mem->page_size || range_end < a || !is_valid_addr_range(*parent->mem, a, range_end)) {
             LOG_ERROR("Invalid read of uint{}_t at address: 0x{:x}\n{}", sizeof(T) * 8, addr, this->cpu->save_context().description());
 
             auto pc = this->cpu->get_pc();
@@ -141,6 +222,9 @@ public:
             return 0;
         }
 
+#ifdef LIBRETRO
+        ensure_guest_page_mapped_rw(*parent->mem, a);
+#endif
         T ret = *ptr.get(*parent->mem);
         if (cpu->log_mem) {
             LOG_TRACE("Read uint{}_t at address: 0x{:x}, val = 0x{:x}", sizeof(T) * 8, addr, ret);
@@ -167,7 +251,9 @@ public:
     template <typename T>
     void MemoryWrite(Dynarmic::A32::VAddr addr, T value) {
         Ptr<T> ptr{ addr };
-        if (!ptr || !ptr.valid(*parent->mem) || ptr.address() < parent->mem->page_size) {
+        const Address a = ptr.address();
+        const Address range_end = a + sizeof(T);
+        if (!ptr || a < parent->mem->page_size || range_end < a || !is_valid_addr_range(*parent->mem, a, range_end)) {
             LOG_ERROR("Invalid write of uint{}_t at addr: 0x{:x}, val = 0x{:x}\n{}", sizeof(T) * 8, addr, value, this->cpu->save_context().description());
 
             auto pc = this->cpu->get_pc();
@@ -178,7 +264,17 @@ public:
             return;
         }
 
-        *ptr.get(*parent->mem) = value;
+        T *const dest = ptr.get(*parent->mem);
+#ifdef LIBRETRO
+        ensure_guest_page_mapped_rw(*parent->mem, a);
+#endif
+#if defined(LIBRETRO) && defined(__APPLE__) && TARGET_OS_IOS
+        sync_guest_write_if_protected(*parent->mem, a);
+#endif
+#ifdef LIBRETRO
+        libretro_trace_memwrite_before_store(*parent->mem, a, static_cast<uint32_t>(sizeof(T)), dest, this->cpu->get_pc());
+#endif
+        *dest = value;
         if (cpu->log_mem) {
             LOG_TRACE("Write uint{}_t at addr: 0x{:x}, val = 0x{:x}", sizeof(T) * 8, addr, value);
         }
@@ -203,7 +299,9 @@ public:
     template <typename T>
     bool MemoryWriteExclusive(Dynarmic::A32::VAddr addr, T value, T expected) {
         Ptr<T> ptr{ addr };
-        if (!ptr || !ptr.valid(*parent->mem) || ptr.address() < parent->mem->page_size) {
+        const Address a = ptr.address();
+        const Address range_end = a + sizeof(T);
+        if (!ptr || a < parent->mem->page_size || range_end < a || !is_valid_addr_range(*parent->mem, a, range_end)) {
             LOG_ERROR("Invalid exclusive write of uint{}_t at addr: 0x{:x}, val = 0x{:x}, expected = 0x{:x}\n{}", sizeof(T) * 8, addr, value, expected, this->cpu->save_context().description());
 
             auto pc = this->cpu->get_pc();
@@ -214,6 +312,12 @@ public:
             return false;
         }
 
+#ifdef LIBRETRO
+        ensure_guest_page_mapped_rw(*parent->mem, a);
+#endif
+#if defined(LIBRETRO) && defined(__APPLE__) && TARGET_OS_IOS
+        sync_guest_write_if_protected(*parent->mem, a);
+#endif
         auto result = Ptr<T>(addr).atomic_compare_and_swap(*parent->mem, value, expected);
         if (cpu->log_mem) {
             LOG_TRACE("Write uint{}_t at addr: 0x{:x}, val = 0x{:x}, expected = 0x{:x}", sizeof(T) * 8, addr, value, expected);
@@ -303,10 +407,21 @@ std::unique_ptr<Dynarmic::A32::Jit> DynarmicCPU::make_jit() {
     config.arch_version = Dynarmic::A32::ArchVersion::v7;
     config.callbacks = cb.get();
     if (parent->mem->use_page_table) {
+#if defined(LIBRETRO) && defined(__APPLE__) && TARGET_OS_IOS
+        // Page-table fast path bypasses MemoryRead/Write callbacks; iOS needs callbacks for
+        // add_protect / commit_guest_rw / diagnostics.
+        config.page_table = nullptr;
+#else
         config.page_table = (log_mem || !cpu_opt) ? nullptr : reinterpret_cast<decltype(config.page_table)>(parent->mem->page_table.get());
+#endif
         config.absolute_offset_page_table = true;
     } else if (!log_mem && cpu_opt) {
+#if defined(LIBRETRO) && defined(__APPLE__) && TARGET_OS_IOS
+        // fastmem_pointer makes the JIT emit direct host stores; those bypass MemoryWrite and any
+        // pre-store sync (protect_tree, iOS 16K/4K commit). Keep callback-based access on iOS.
+#else
         config.fastmem_pointer = std::bit_cast<uintptr_t>(parent->mem->memory.get());
+#endif
     }
     config.hook_hint_instructions = true;
     config.enable_cycle_counting = false;

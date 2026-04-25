@@ -22,6 +22,7 @@
 #include "screen_filters.h"
 
 #include <memory>
+#include <vector>
 
 struct SDL_Window;
 
@@ -36,6 +37,13 @@ public:
 
     vk::SurfaceKHR surface;
     vk::SwapchainKHR swapchain;
+
+#ifdef LIBRETRO
+    /// RetroArch already owns the VkSurfaceKHR swapchain; we render to these images and \c set_image.
+    bool libretro_hw_surface = false;
+    uint32_t libretro_rotating_image_idx = 0;
+    std::vector<vkutil::Image> libretro_swapchain_images;
+#endif
 
     vk::SurfaceCapabilitiesKHR surface_capabilities;
     vk::SurfaceFormatKHR surface_format;

@@ -24,7 +24,74 @@
 
 #include <util/log.h>
 
+#include <algorithm>
+#include <cmath>
+
 namespace renderer::vulkan {
+
+namespace {
+
+// MoltenVK / MTLDebugRenderCommandEncoder: scissor must lie within the current render pass extent.
+void clamp_scissor_to_render_target(VKContext &context) {
+    if (!context.render_target)
+        return;
+    const uint32_t rtw = context.render_target->width;
+    const uint32_t rth = context.render_target->height;
+    if (rtw == 0 || rth == 0)
+        return;
+
+    const int32_t ox = context.scissor.offset.x;
+    const int32_t oy = context.scissor.offset.y;
+    if (ox < 0 || oy < 0)
+        return;
+
+    const auto uox = static_cast<uint32_t>(ox);
+    const auto uoy = static_cast<uint32_t>(oy);
+    if (uox >= rtw || uoy >= rth) {
+        context.scissor.extent.width = 0;
+        context.scissor.extent.height = 0;
+        return;
+    }
+    context.scissor.extent.width = std::min(context.scissor.extent.width, rtw - uox);
+    context.scissor.extent.height = std::min(context.scissor.extent.height, rth - uoy);
+}
+
+// MoltenVK: debug layer rejects NaN/Inf and non-positive *width* / *degenerate* height on setViewport.
+// With VK_KHR_maintenance1 (required by this renderer), VkViewport.height may be **negative** for Y-flip;
+// treating (height <= 0) as invalid was wrong and forced a full-RT fallback — if that RT was a 1×1
+// placeholder, the guest ended up with a 1×1 viewport and stalled GPU/sync (e.g. Libretro + MoltenVK).
+void sanitize_viewport_vulkan(VKContext &context) {
+    if (!context.render_target)
+        return;
+    auto &vp = context.viewport;
+    const float rtw = static_cast<float>(context.render_target->width);
+    const float rth = static_cast<float>(context.render_target->height);
+
+    const bool finite = std::isfinite(vp.x) && std::isfinite(vp.y) && std::isfinite(vp.width) && std::isfinite(vp.height)
+        && std::isfinite(vp.minDepth) && std::isfinite(vp.maxDepth);
+    // Width must be strictly positive. Height may be negative (Vulkan Y-flip); only ~0 is degenerate.
+    const bool width_invalid = !std::isfinite(vp.width) || vp.width <= 0.f;
+    const bool height_invalid = !std::isfinite(vp.height) || (std::abs(vp.height) <= 1e-20f);
+    if (!finite || width_invalid || height_invalid) {
+#ifdef LIBRETRO
+        LOG_WARN_ONCE("[VITA3K-LR] Clamping invalid viewport (non-finite, non-positive width, or zero height) to render target {}x{}",
+            context.render_target->width, context.render_target->height);
+#endif
+        vp = vk::Viewport{
+            .x = 0.f,
+            .y = 0.f,
+            .width = std::max(rtw, 1.f),
+            .height = std::max(rth, 1.f),
+            .minDepth = 0.f,
+            .maxDepth = 1.f
+        };
+        return;
+    }
+    vp.minDepth = std::clamp(vp.minDepth, 0.f, 1.f);
+    vp.maxDepth = std::clamp(vp.maxDepth, 0.f, 1.f);
+}
+
+} // namespace
 
 void sync_clipping(VKContext &context) {
     if (!context.render_target)
@@ -69,6 +136,8 @@ void sync_clipping(VKContext &context) {
         context.scissor.extent.height = std::max(context.scissor.extent.height - context.scissor.offset.y, 0U);
         context.scissor.offset.y = 0;
     }
+
+    clamp_scissor_to_render_target(context);
 
     if (!context.is_recording)
         return;
@@ -157,6 +226,8 @@ void sync_point_line_width(VKContext &context, const bool is_front) {
 }
 
 void sync_viewport_flat(VKContext &context) {
+    if (!context.render_target)
+        return;
     context.viewport = vk::Viewport{
         .x = 0.0f,
         .y = 0.0f,
@@ -165,6 +236,7 @@ void sync_viewport_flat(VKContext &context) {
         .minDepth = 0.0f,
         .maxDepth = 1.0f
     };
+    sanitize_viewport_vulkan(context);
 
     if (!context.is_recording)
         return;
@@ -173,6 +245,8 @@ void sync_viewport_flat(VKContext &context) {
 
 void sync_viewport_real(VKContext &context, const float xOffset, const float yOffset, const float zOffset,
     const float xScale, const float yScale, const float zScale) {
+    if (!context.render_target)
+        return;
     if (xScale < 0)
         LOG_ERROR("Game is using a viewport with negative width!");
 
@@ -182,6 +256,22 @@ void sync_viewport_real(VKContext &context, const float xOffset, const float yOf
     const float y = yOffset - yScale;
 
     const float res_multiplier = context.state.res_multiplier;
+
+    // Degenerate or non-finite GXM viewport: e.g. yScale==0 → h==0; NaN scales bypass (NaN <= x) is
+    // false and would reach sanitize. MoltenVK rejects setViewport; sanitize clamps to RT — on a 1×1
+    // transient attachment that stalls sync. Fall back to flat full-RT viewport (matches GL abs path).
+    if (!std::isfinite(w) || !std::isfinite(h) || !std::isfinite(x) || !std::isfinite(y) || !std::isfinite(res_multiplier)) {
+        sync_viewport_flat(context);
+        return;
+    }
+    {
+        const float vw = w * res_multiplier;
+        const float vh = h * res_multiplier;
+        if (!std::isfinite(vw) || !std::isfinite(vh) || vw <= 1e-6f || std::abs(vh) <= 1e-6f) {
+            sync_viewport_flat(context);
+            return;
+        }
+    }
 
     // https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VkViewport.html
     // https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#vertexpostproc-viewport
@@ -196,6 +286,7 @@ void sync_viewport_real(VKContext &context, const float xOffset, const float yOf
         .minDepth = 0.0f,
         .maxDepth = 1.0f
     };
+    sanitize_viewport_vulkan(context);
 
     if (!context.is_recording)
         return;

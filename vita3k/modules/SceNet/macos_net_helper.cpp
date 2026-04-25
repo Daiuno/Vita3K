@@ -17,16 +17,45 @@
 
 #include "macos_net_helper.h"
 
-#include <SystemConfiguration/SystemConfiguration.h>
+#include <TargetConditionals.h>
 #include <cstring>
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <net/if_dl.h>
 
+#if !TARGET_OS_IOS
+#include <SystemConfiguration/SystemConfiguration.h>
+#endif
+
 // Check if interface is physical (en*)
 bool is_physical_interface(const char *name) {
     return name && strncmp(name, "en", 2) == 0;
 }
+
+#if TARGET_OS_IOS
+
+// SCDynamicStore* are macOS-only.  On iOS we approximate the primary interface
+// by returning the first non-loopback physical interface from getifaddrs().
+bool get_primary_interface_name(char *dest, size_t bufferSize) {
+    if (!dest || bufferSize == 0)
+        return false;
+    struct ifaddrs *list = nullptr;
+    if (getifaddrs(&list) != 0)
+        return false;
+    bool ok = false;
+    for (auto *cur = list; cur; cur = cur->ifa_next) {
+        if (cur->ifa_name && is_physical_interface(cur->ifa_name)) {
+            std::strncpy(dest, cur->ifa_name, bufferSize - 1);
+            dest[bufferSize - 1] = '\0';
+            ok = true;
+            break;
+        }
+    }
+    freeifaddrs(list);
+    return ok;
+}
+
+#else
 
 // Get the primary network interface name using SystemConfiguration
 bool get_primary_interface_name(char *dest, size_t bufferSize) {
@@ -65,6 +94,8 @@ bool get_primary_interface_name(char *dest, size_t bufferSize) {
     CFRelease(store);
     return success;
 }
+
+#endif // !TARGET_OS_IOS
 
 // Get MAC address from a physical interface
 // If hint is a physical interface, use it; otherwise find first active en*

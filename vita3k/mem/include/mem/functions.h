@@ -61,6 +61,11 @@ bool is_protecting(MemState &state, Address addr, MemPerm *perm = nullptr);
 bool is_valid_addr(const MemState &state, Address addr);
 bool is_valid_addr_range(const MemState &state, Address start, Address end);
 bool handle_access_violation(MemState &state, uint8_t *addr, bool write) noexcept;
+/// On iOS libretro, guest stores cannot rely on SIGSEGV for add_protect(ReadOnly) — resolve before the host store.
+void sync_guest_write_if_protected(MemState &state, Address vaddr) noexcept;
+/// Libretro + host page > guest page (e.g. iOS 16K/4K): ensure the host mapping for vaddr's guest page is RW before load/store.
+/// Uses a per-thread cache to avoid mprotect on every access within the same host page.
+void ensure_guest_page_mapped_rw(MemState &state, Address vaddr) noexcept;
 Block alloc_block(MemState &mem, uint32_t size, const char *name, Address start_addr = user_main_memory_start);
 Address alloc_at(MemState &state, Address address, uint32_t size, const char *name);
 Address try_alloc_at(MemState &state, Address address, uint32_t size, const char *name);

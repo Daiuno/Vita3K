@@ -118,35 +118,80 @@ static void process_batch(renderer::State &state, const FeatureState &features, 
 }
 
 void process_batches(renderer::State &state, const FeatureState &features, MemState &mem, Config &config) {
-    // always display a frame every 500ms
-    auto max_time = duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() + 500;
+    // Phase 1: drain until a displayable frame appears (original behaviour).
+    // Phase 2: once should_display is set, do a quick non-blocking sweep for
+    //          any remaining ready commands (especially SignalSyncObject) that
+    //          were already queued.  This prevents the libretro split-frame
+    //          model from stranding sync commands behind a NewFrame.
+    //
+    // The desktop front-end runs process_batches & render_frame in a tight
+    // while(!quit) loop so exiting early on should_display is harmless — the
+    // next iteration picks up leftovers microseconds later.  In libretro each
+    // retro_run is one host frame (~16 ms); stranding a SignalSyncObject for a
+    // full frame can deadlock the display_entry_thread, fill the display queue,
+    // and block the guest in sceGxmDisplayQueueAddEntry.
 
+    constexpr int64_t k_max_batch_drain_ms = 16;
+    auto max_time = duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() + k_max_batch_drain_ms;
+
+    int batches_processed = 0;
+    int loops_stalled = 0;
+
+    // ---- phase 1: drain until a frame is ready --------------------------------
     while (!state.should_display) {
-        // Try to wait for a batch (about 2 or 3ms, game should be fast for this)
         auto cmd_list = state.command_buffer_queue.top(3);
 
         if (!cmd_list || !is_cmd_ready(mem, *cmd_list)) {
-            // beginning of the game or homebrew not using gxm
-            if (state.context == nullptr)
+            if (state.context == nullptr) {
+                if (batches_processed == 0 && loops_stalled == 0)
+                    LOG_INFO("[GXM-BATCH] early-return: context is null (no GXM ctx yet)");
                 return;
+            }
 
-            // keep the old behavior for opengl with vsync as it looks like the new one causes some issues
             if (state.current_backend == Backend::OpenGL && config.current_config.v_sync)
                 return;
 
             if (!cmd_list || !wait_cmd(mem, *cmd_list)) {
                 auto curr_time = duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-                if (curr_time >= max_time)
-                    // display a frame even though the game is not diplaying anything
-                    return;
+                if (curr_time >= max_time) {
+                    if (batches_processed == 0)
+                        LOG_INFO("[GXM-BATCH] budget expired: {} loops stalled, qsize={}",
+                                 loops_stalled, state.command_buffer_queue.size());
+                    goto phase2;
+                }
 
-                // this mean the command is still not ready, check if we can display it again
+                ++loops_stalled;
+                if (loops_stalled == 1 && batches_processed == 0) {
+                    uint32_t op = cmd_list ? static_cast<uint32_t>(cmd_list->first ? static_cast<uint32_t>(cmd_list->first->opcode) : 0xFFFF) : 0xFFFF;
+                    LOG_INFO("[GXM-BATCH] stalled: cmd_list={} first_op={} qsize={}",
+                             cmd_list ? "yes" : "no", op, state.command_buffer_queue.size());
+                }
                 continue;
             }
         }
 
         state.command_buffer_queue.pop();
         process_batch(state, features, mem, config, *cmd_list);
+        ++batches_processed;
+    }
+
+    // ---- phase 2: quick sweep of already-queued ready commands ---------------
+    // Use 0-us timeout so we never block waiting for *new* work; we just pick
+    // up whatever command lists were already submitted before the NewFrame that
+    // set should_display.
+phase2:
+    while (true) {
+        auto cmd_list = state.command_buffer_queue.top(1);  // 1us timeout, truly non-blocking
+
+        if (!cmd_list || !is_cmd_ready(mem, *cmd_list)) {
+            // Queue empty or front entry not ready — don't wait, next
+            // retro_run will retry.
+            break;
+        }
+
+        state.command_buffer_queue.pop();
+        process_batch(state, features, mem, config, *cmd_list);
+        ++batches_processed;
     }
 }
 

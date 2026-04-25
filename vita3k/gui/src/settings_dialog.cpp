@@ -526,8 +526,12 @@ void set_config(EmuEnvState &emuenv) {
     emuenv.display.fps_hack = emuenv.cfg.current_config.fps_hack;
 
     // No change it if app already running
-    if (emuenv.io.title_id.empty())
+    if (emuenv.io.title_id.empty()) {
         emuenv.kernel.cpu_opt = emuenv.cfg.current_config.cpu_opt;
+#ifdef LIBRETRO
+        emuenv.kernel.cpu_backend = emuenv.cfg.cpu_backend;
+#endif
+    }
 
     emuenv.audio.set_global_volume(emuenv.cfg.current_config.audio_volume / 100.f);
 }

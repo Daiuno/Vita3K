@@ -28,6 +28,15 @@
 
 #include <SDL3/SDL_keyboard.h>
 
+#ifdef LIBRETRO
+extern "C" void libretro_input_fill_ctrl(int port,
+                                         uint32_t *buttons,
+                                         uint8_t  *lx,
+                                         uint8_t  *ly,
+                                         uint8_t  *rx,
+                                         uint8_t  *ry);
+#endif // LIBRETRO
+
 #ifdef ANDROID
 #include <SDL3/SDL_joystick.h>
 #include <jni.h>
@@ -361,6 +370,16 @@ static void retrieve_ctrl_data(EmuEnvState &emuenv, int port, bool is_v2, bool n
         return;
     }
 
+#ifdef LIBRETRO
+    // libretro build: skip SDL keyboard/gamepad scan and let the frontend
+    // provide the pad state.  Output byte axes are written directly by the
+    // bridge (0x80 = center), so reset_axes() afterwards re-maps `buttons`
+    // for sceCtrlReadBufferNegative callers only.
+    libretro_input_fill_ctrl(port, &buttons, &lx, &ly, &rx, &ry);
+    if (negative)
+        buttons ^= ~0u;
+    return;
+#else
     if (emuenv.cfg.current_config.pstv_mode) {
         if (port == 1) {
             apply_keyboard(&buttons, axes.data(), is_v2, emuenv);
@@ -380,6 +399,7 @@ static void retrieve_ctrl_data(EmuEnvState &emuenv, int port, bool is_v2, bool n
     }
 
     reset_axes();
+#endif // LIBRETRO
 }
 
 int ctrl_get(const SceUID thread_id, EmuEnvState &emuenv, int port, SceCtrlData2 *pData, SceUInt32 count, bool negative, bool is_peek, bool is_v2, bool from_ext) {

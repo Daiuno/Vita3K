@@ -103,7 +103,9 @@ EXPORT(int, _sceIoLseekAsync) {
 
 EXPORT(int, _sceIoMkdir, const char *dir, const SceMode mode) {
     TRACY_FUNC(_sceIoMkdir, dir, mode);
-    return create_dir(emuenv.io, dir, mode, emuenv.pref_path, export_name);
+    // Recursive: games often mkdir a full path (e.g. savedata0:/output/savegame) in one call; POSIX mkdir would fail
+    // if parents are missing. Host create_directories matches that need and returns SCE_OK (0) on success.
+    return create_dir(emuenv.io, dir, mode, emuenv.pref_path, export_name, true);
 }
 
 EXPORT(int, _sceIoMkdirAsync) {

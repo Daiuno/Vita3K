@@ -94,26 +94,33 @@ target_include_directories(miniz PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/miniz")
 add_subdirectory(sdl)
 
 # Cubeb setup, from https://github.com/RPCS3/rpcs3/blob/master/3rdparty/cubeb/CMakeLists.txt
-set(BUILD_SHARED_LIBS FALSE CACHE BOOL "Don't build shared libs")
-set(BUILD_TESTS FALSE CACHE BOOL "Don't build tests")
-set(BUILD_RUST_LIBS FALSE CACHE BOOL "Don't build rust libs")
-set(BUILD_TOOLS FALSE CACHE BOOL "Don't build tools")
-set(BUNDLE_SPEEX TRUE CACHE BOOL "Bundle the speex library")
-set(LAZY_LOAD_LIBS TRUE CACHE BOOL "Lazily load shared libraries")
-set(USE_SANITIZERS FALSE CACHE BOOL "Dont't use sanitizers")
+# Skipped on iOS — cubeb's CoreAudio backend depends on macOS-only headers.
+if(NOT IOS)
+    set(BUILD_SHARED_LIBS FALSE CACHE BOOL "Don't build shared libs")
+    set(BUILD_TESTS FALSE CACHE BOOL "Don't build tests")
+    set(BUILD_RUST_LIBS FALSE CACHE BOOL "Don't build rust libs")
+    set(BUILD_TOOLS FALSE CACHE BOOL "Don't build tools")
+    set(BUNDLE_SPEEX TRUE CACHE BOOL "Bundle the speex library")
+    set(LAZY_LOAD_LIBS TRUE CACHE BOOL "Lazily load shared libraries")
+    set(USE_SANITIZERS FALSE CACHE BOOL "Dont't use sanitizers")
 
-add_subdirectory(cubeb EXCLUDE_FROM_ALL)
+    add_subdirectory(cubeb EXCLUDE_FROM_ALL)
+else()
+    add_library(cubeb INTERFACE)
+endif()
 
-if (ARCHITECTURE STREQUAL "arm64")
-	target_compile_definitions(speex PUBLIC
-		#_USE_NEON
-	)
-elseif (ARCHITECTURE STREQUAL "x86_64")
-	target_compile_definitions(speex PUBLIC
-		_USE_SSE
-		_USE_SSE2
-	)
-endif ()
+if(NOT IOS)
+	if (ARCHITECTURE STREQUAL "arm64")
+		target_compile_definitions(speex PUBLIC
+			#_USE_NEON
+		)
+	elseif (ARCHITECTURE STREQUAL "x86_64")
+		target_compile_definitions(speex PUBLIC
+			_USE_SSE
+			_USE_SSE2
+		)
+	endif ()
+endif()
 
 if(ANDROID)
 	add_subdirectory(libadrenotools)
@@ -272,7 +279,9 @@ if(ANDROID)
 endif()
 add_subdirectory(ffmpeg)
 
-if(APPLE OR NOT FORCE_BUILD_OPENSSL_MAC)
+if((APPLE OR NOT FORCE_BUILD_OPENSSL_MAC) AND NOT IOS)
+	# On iOS the Homebrew-installed OpenSSL would pull in host x86_64/macOS
+	# binaries, so skip the brew hint entirely and force a source build.
 	execute_process(
 		COMMAND brew --prefix openssl
 		RESULT_VARIABLE BREW_RESULT
@@ -285,7 +294,7 @@ if(APPLE OR NOT FORCE_BUILD_OPENSSL_MAC)
 	endif()
 endif()
 
-if(NOT FORCE_BUILD_OPENSSL_MAC)
+if(NOT FORCE_BUILD_OPENSSL_MAC AND NOT IOS)
 	find_package(OpenSSL QUIET)
 endif()
 
@@ -322,7 +331,38 @@ if(NOT OPENSSL_FOUND OR FORCE_BUILD_OPENSSL_MAC)
 
 		if (NOT EXISTS "${CMAKE_BINARY_DIR}/external/openssl/libssl.a" OR NOT EXISTS "${CMAKE_BINARY_DIR}/external/openssl/libcrypto.a")
 			message(STATUS "Building OpenSSL@3...")
-			if (ARCHITECTURE STREQUAL "x86_64" OR ARCHITECTURE STREQUAL "arm64")
+			if (IOS)
+				# iOS cross-compile (arm64 only).  OpenSSL's ios64-cross
+				# Configure target expects CROSS_TOP / CROSS_SDK to point at
+				# the iPhoneOS developer platform.  It internally appends
+				# `-isysroot $(CROSS_TOP)/SDKs/$(CROSS_SDK)` to CFLAGS; if
+				# those are empty the earlier -isysroot on CC is clobbered.
+				set(OPENSSL_IOS_MIN "13.0")
+				get_filename_component(OPENSSL_IOS_SDK_NAME "${CMAKE_OSX_SYSROOT}" NAME)
+				get_filename_component(OPENSSL_IOS_CROSS_TOP "${CMAKE_OSX_SYSROOT}" DIRECTORY)
+				get_filename_component(OPENSSL_IOS_CROSS_TOP "${OPENSSL_IOS_CROSS_TOP}" DIRECTORY)
+				message(STATUS "OpenSSL iOS CROSS_TOP=${OPENSSL_IOS_CROSS_TOP} CROSS_SDK=${OPENSSL_IOS_SDK_NAME}")
+				set(OPENSSL_IOS_CC
+					"${CMAKE_C_COMPILER} -mios-version-min=${OPENSSL_IOS_MIN}")
+				execute_process(
+					COMMAND ${CMAKE_COMMAND} -E env
+						"CC=${OPENSSL_IOS_CC}"
+						"CROSS_COMPILE="
+						"CROSS_TOP=${OPENSSL_IOS_CROSS_TOP}"
+						"CROSS_SDK=${OPENSSL_IOS_SDK_NAME}"
+						perl Configure ios64-cross
+							no-shared no-tests no-dso no-hw no-engine no-async
+					WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/external/openssl")
+				execute_process(
+					COMMAND ${CMAKE_COMMAND} -E env
+						"CC=${OPENSSL_IOS_CC}"
+						"CROSS_COMPILE="
+						"CROSS_TOP=${OPENSSL_IOS_CROSS_TOP}"
+						"CROSS_SDK=${OPENSSL_IOS_SDK_NAME}"
+						make -j${CPU_COUNT} build_libs
+					WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/external/openssl"
+					OUTPUT_QUIET)
+			elseif (ARCHITECTURE STREQUAL "x86_64" OR ARCHITECTURE STREQUAL "arm64")
 				execute_process(COMMAND perl Configure darwin64-${ARCHITECTURE} -mmacosx-version-min=11 WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/external/openssl")
 				execute_process(COMMAND make -j${CPU_COUNT} WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/external/openssl" OUTPUT_QUIET)
 			else()
@@ -344,7 +384,27 @@ if(NOT OPENSSL_FOUND OR FORCE_BUILD_OPENSSL_MAC)
 		set(OPENSSL_ROOT_DIR "${CMAKE_BINARY_DIR}/external/openssl")
 		set(OPENSSL_USE_STATIC_LIBS TRUE)
 	endif()
-	find_package(OpenSSL REQUIRED)
+	if(IOS)
+		# The toolchain forces CMake to search libraries only under the iOS
+		# SDK, so FindOpenSSL won't pick up our locally-built copy.
+		# Populate the result variables manually and skip the find_package call.
+		set(OPENSSL_INCLUDE_DIR    "${OPENSSL_ROOT_DIR}/include")
+		set(OPENSSL_CRYPTO_LIBRARY "${OPENSSL_ROOT_DIR}/libcrypto.a")
+		set(OPENSSL_SSL_LIBRARY    "${OPENSSL_ROOT_DIR}/libssl.a")
+		set(OPENSSL_LIBRARIES      "${OPENSSL_SSL_LIBRARY}" "${OPENSSL_CRYPTO_LIBRARY}")
+		set(OPENSSL_FOUND TRUE)
+		add_library(OpenSSL::Crypto STATIC IMPORTED)
+		set_target_properties(OpenSSL::Crypto PROPERTIES
+			IMPORTED_LOCATION "${OPENSSL_CRYPTO_LIBRARY}"
+			INTERFACE_INCLUDE_DIRECTORIES "${OPENSSL_INCLUDE_DIR}")
+		add_library(OpenSSL::SSL STATIC IMPORTED)
+		set_target_properties(OpenSSL::SSL PROPERTIES
+			IMPORTED_LOCATION "${OPENSSL_SSL_LIBRARY}"
+			INTERFACE_INCLUDE_DIRECTORIES "${OPENSSL_INCLUDE_DIR}"
+			INTERFACE_LINK_LIBRARIES OpenSSL::Crypto)
+	else()
+		find_package(OpenSSL REQUIRED)
+	endif()
 endif()
 
 message("OpenSSL include dir: ${OPENSSL_INCLUDE_DIR}")
@@ -455,10 +515,14 @@ endif()
 # Use XDG desktop portals on Linux
 set(NFD_PORTAL ON)
 
-if(NOT ANDROID)
+if(NOT ANDROID AND NOT IOS)
 	# nativefiledialog-extended
 	add_subdirectory(nativefiledialog-extended)
 
 	# Create alias to prevent the need of multiple changes in case the target name changes
+	add_library(NFDe::NFDe ALIAS nfd)
+else()
+	# Provide a header-only stub library so callers can still link unconditionally.
+	add_library(nfd INTERFACE)
 	add_library(NFDe::NFDe ALIAS nfd)
 endif()

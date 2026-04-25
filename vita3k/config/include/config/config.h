@@ -105,6 +105,8 @@ enum ScreenshotFormat {
     code(float, "background-alpha", .300f, background_alpha)                                            \
     code(int, "log-level", 0 /*SPDLOG_LEVEL_TRACE*/, log_level)                                         \
     code(bool, "cpu-opt", true, cpu_opt)                                                                \
+    code(std::string, "cpu-backend", "dynarmic_jit", cpu_backend)                                       \
+    code(int, "jit-block-size-kib", 256, jit_block_size_kib)                                            \
     code(std::string, "pref-path", std::string{}, pref_path)                                            \
     code(bool, "discord-rich-presence", true, discord_rich_presence)                                    \
     code(bool, "wait-for-debugger", false, wait_for_debugger)                                           \

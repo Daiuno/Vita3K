@@ -27,6 +27,15 @@
 #include <util/align.h>
 #include <vkutil/vkutil.h>
 
+#ifdef LIBRETRO
+#include <util/log.h>
+#include <vkutil/vma_libretro.h>
+#endif
+
+#include <algorithm>
+#include <atomic>
+#include <bit>
+
 namespace renderer::vulkan {
 
 // return if this format can be used to read a depth stencil buffer
@@ -325,13 +334,30 @@ static vk::Format bcn_to_rgba8(const vk::Format format) {
     }
 }
 
+#ifdef LIBRETRO
+namespace {
+std::atomic<uint32_t> g_lr_vma_configure_seq{0};
+std::atomic<uint32_t> g_lr_vma_import_seq{0};
+
+// Vulkan 1.x: mipLevels <= floor(log2(max(width,height))) + 1  — use bit_width(max_edge).
+uint32_t libretro_vulkan_max_mip_levels_for_extent(uint32_t width, uint32_t height) {
+    const uint32_t max_edge = std::max({ 1u, width, height });
+    return std::max(1u, static_cast<uint32_t>(std::bit_width(max_edge)));
+}
+
+} // namespace
+#endif
+
 // get an upper bound on the amount of memory needed to upload this texture
 // the bound is only for one face and the base mip
-static uint32_t get_image_memory_upper_bound(const SceGxmTexture &gxm_texture, const vk::Format vk_format, const SceGxmTextureBaseFormat base_format) {
+// eff_width / eff_height: final image dimensions (after clamp + block alignment on libretro) so we
+// never call next_power_of_two on raw guest garbage (bit_ceil overflow) or disagree with VkImage.
+static uint32_t get_image_memory_upper_bound(const SceGxmTexture &gxm_texture, const vk::Format vk_format, const SceGxmTextureBaseFormat base_format,
+    uint32_t eff_width, uint32_t eff_height) {
     // we only want an upper bound, it doesn't matter if because of some conversions we later get the width instead of the stride
     // aligning to 8 takes care of the default stride values
-    uint32_t stride = std::max(next_power_of_two(gxm::get_width(gxm_texture)), 8U);
-    uint32_t height = std::max(next_power_of_two(gxm::get_height(gxm_texture)), 8U);
+    uint32_t stride = std::max(next_power_of_two(eff_width), 8U);
+    uint32_t height_px = std::max(next_power_of_two(eff_height), 8U);
 
     if (gxm_texture.texture_type() == SCE_GXM_TEXTURE_LINEAR_STRIDED) {
         const uint32_t bpp = (gxm::bits_per_pixel(base_format) + 7) / 8;
@@ -339,7 +365,7 @@ static uint32_t get_image_memory_upper_bound(const SceGxmTexture &gxm_texture, c
         stride = std::max<uint32_t>(stride, gxm::get_stride_in_bytes(gxm_texture) / bpp);
     }
 
-    return ((stride * height) / vk::texelsPerBlock(vk_format)) * vk::blockSize(vk_format);
+    return ((stride * height_px) / vk::texelsPerBlock(vk_format)) * vk::blockSize(vk_format);
 }
 
 void VKTextureCache::configure_texture(const SceGxmTexture &gxm_texture) {
@@ -350,10 +376,14 @@ void VKTextureCache::configure_texture(const SceGxmTexture &gxm_texture) {
 
     const bool is_cube = (gxm_texture.texture_type() == SCE_GXM_TEXTURE_CUBE || gxm_texture.texture_type() == SCE_GXM_TEXTURE_CUBE_ARBITRARY);
 
-    uint32_t width = gxm::get_width(gxm_texture);
-    uint32_t height = gxm::get_height(gxm_texture);
-
-    const uint16_t mip_count = renderer::texture::get_upload_mip(gxm_texture.true_mip_count(), width, height);
+#ifdef LIBRETRO
+    const uint32_t max_dim = state.physical_device_properties.limits.maxImageDimension2D;
+    uint32_t width = vkutil::clamp_image_extent_component(std::max(1u, gxm::get_width(gxm_texture)), max_dim);
+    uint32_t height = vkutil::clamp_image_extent_component(std::max(1u, gxm::get_height(gxm_texture)), max_dim);
+#else
+    uint32_t width = std::max(1u, gxm::get_width(gxm_texture));
+    uint32_t height = std::max(1u, gxm::get_height(gxm_texture));
+#endif
 
     vk::Format vk_format = texture::translate_format(base_format);
     if (gxm::is_bcn_format(base_format) && !support_dxt)
@@ -362,10 +392,28 @@ void VKTextureCache::configure_texture(const SceGxmTexture &gxm_texture) {
     if (gxm_texture.gamma_mode)
         vk_format = linear_to_srgb(vk_format);
 
-    current_texture->mip_count = mip_count;
+#ifdef LIBRETRO
+    // MoltenVK: compressed optimal images must use block-aligned extents.
+    vkutil::clamp_image_extent_to_block_grid(width, height, vk_format, max_dim);
+#endif
+
+    const uint16_t mip_count = renderer::texture::get_upload_mip(gxm_texture.true_mip_count(), static_cast<uint16_t>(width), static_cast<uint16_t>(height));
+    uint32_t mip_levels_vk = std::max(1u, static_cast<uint32_t>(mip_count));
+#ifdef LIBRETRO
+    {
+        const uint32_t mips_cap = libretro_vulkan_max_mip_levels_for_extent(width, height);
+        if (mip_levels_vk > mips_cap) {
+            LOG_WARN("[VITA3K-LR] configure_texture: clamping mipLevels {} -> {} ({}x{} fmt={} true_mip={})",
+                mip_levels_vk, mips_cap, width, height, vk::to_string(vk_format), gxm_texture.true_mip_count());
+            mip_levels_vk = mips_cap;
+        }
+    }
+#endif
+
+    current_texture->mip_count = static_cast<uint16_t>(mip_levels_vk);
     current_texture->is_cube = is_cube;
-    uint32_t memory_needed = get_image_memory_upper_bound(gxm_texture, vk_format, base_format);
-    if (mip_count > 1)
+    uint32_t memory_needed = get_image_memory_upper_bound(gxm_texture, vk_format, base_format, width, height);
+    if (mip_levels_vk > 1)
         // using mips, the overall memory needed will be 4/3 of the base memory
         // round up to 3/2
         memory_needed += memory_needed / 2;
@@ -393,7 +441,7 @@ void VKTextureCache::configure_texture(const SceGxmTexture &gxm_texture) {
             .width = width,
             .height = height,
             .depth = 1 },
-        .mipLevels = mip_count,
+        .mipLevels = mip_levels_vk,
         .arrayLayers = is_cube ? 6U : 1U,
         .samples = vk::SampleCountFlagBits::e1,
         .tiling = vk::ImageTiling::eOptimal,
@@ -402,13 +450,27 @@ void VKTextureCache::configure_texture(const SceGxmTexture &gxm_texture) {
         .initialLayout = vk::ImageLayout::eUndefined,
     };
 
+#ifdef LIBRETRO
+    {
+        const uint32_t seq = ++g_lr_vma_configure_seq;
+        vkutil::LibretroVmaCreateImageExtras extras{};
+        extras.fmt = vk_format;
+        extras.base_fmt_hex = static_cast<unsigned>(base_format);
+        extras.raw_gxm_w = gxm::get_width(gxm_texture);
+        extras.raw_gxm_h = gxm::get_height(gxm_texture);
+        extras.max_dim = max_dim;
+        extras.has_texture_context = true;
+        vkutil::libretro_vma_create_image(state.allocator, image_info, "configure", seq, image.image, image.allocation, &extras);
+    }
+#else
     std::tie(image.image, image.allocation) = state.allocator.createImage(image_info, vkutil::vma_auto_alloc);
+#endif
 
     // create image view
     vk::ImageSubresourceRange range{
         .aspectMask = vk::ImageAspectFlagBits::eColor,
         .baseMipLevel = 0,
-        .levelCount = mip_count,
+        .levelCount = mip_levels_vk,
         .baseArrayLayer = 0,
         .layerCount = is_cube ? 6U : 1U
     };
@@ -573,6 +635,40 @@ void VKTextureCache::configure_sampler(size_t index, const SceGxmTexture &textur
 }
 
 void VKTextureCache::import_configure_impl(SceGxmTextureBaseFormat base_format, uint32_t width, uint32_t height, bool is_srgb, uint16_t nb_components, uint16_t mipcount, bool swap_rb) {
+#ifdef LIBRETRO
+    const uint32_t log_import_param_w = width;
+    const uint32_t log_import_param_h = height;
+    const uint32_t max_dim = state.physical_device_properties.limits.maxImageDimension2D;
+    width = vkutil::clamp_image_extent_component(std::max(1u, width), max_dim);
+    height = vkutil::clamp_image_extent_component(std::max(1u, height), max_dim);
+#else
+    width = std::max(1u, width);
+    height = std::max(1u, height);
+#endif
+
+    vk::Format vk_format = texture::translate_format(base_format);
+    if (is_srgb)
+        vk_format = linear_to_srgb(vk_format);
+
+#ifdef LIBRETRO
+    vkutil::clamp_image_extent_to_block_grid(width, height, vk_format, max_dim);
+#endif
+
+    {
+        const uint32_t max_mips = std::max(1u, static_cast<uint32_t>(std::bit_width(std::min(width, height))));
+        mipcount = static_cast<uint16_t>(std::clamp(static_cast<uint32_t>(mipcount), 1u, max_mips));
+    }
+    uint32_t mip_levels_vk = std::max(1u, static_cast<uint32_t>(mipcount));
+#ifdef LIBRETRO
+    {
+        const uint32_t mips_cap = libretro_vulkan_max_mip_levels_for_extent(width, height);
+        if (mip_levels_vk > mips_cap) {
+            LOG_WARN("[VITA3K-LR] import_configure: clamping mipLevels {} -> {} ({}x{} fmt={} mipcount_in={})",
+                mip_levels_vk, mips_cap, width, height, vk::to_string(vk_format), mipcount);
+            mip_levels_vk = mips_cap;
+        }
+    }
+#endif
     uint32_t texture_size;
     if (renderer::texture::is_astc_format(base_format)) {
         texture_size = renderer::texture::get_compressed_size(base_format, width, height);
@@ -582,8 +678,8 @@ void VKTextureCache::import_configure_impl(SceGxmTextureBaseFormat base_format, 
     }
     current_texture->memory_needed = align(texture_size, 16);
 
-    current_texture->mip_count = mipcount;
-    if (mipcount > 1)
+    current_texture->mip_count = static_cast<uint16_t>(mip_levels_vk);
+    if (mip_levels_vk > 1)
         current_texture->memory_needed += current_texture->memory_needed / 2;
 
     const bool is_cube = current_info->texture.texture_type() == SCE_GXM_TEXTURE_CUBE || current_info->texture.texture_type() == SCE_GXM_TEXTURE_CUBE_ARBITRARY;
@@ -596,10 +692,6 @@ void VKTextureCache::import_configure_impl(SceGxmTextureBaseFormat base_format, 
     // because of texture importation, we must be careful when destroying an image
     if (image.image)
         state.frame().destroy_queue.add_image(image);
-
-    vk::Format vk_format = texture::translate_format(base_format);
-    if (is_srgb)
-        vk_format = linear_to_srgb(vk_format);
 
     // manually initialize the image
     image.width = width;
@@ -615,7 +707,7 @@ void VKTextureCache::import_configure_impl(SceGxmTextureBaseFormat base_format, 
             .width = width,
             .height = height,
             .depth = 1 },
-        .mipLevels = mipcount,
+        .mipLevels = mip_levels_vk,
         .arrayLayers = is_cube ? 6U : 1U,
         .samples = vk::SampleCountFlagBits::e1,
         .tiling = vk::ImageTiling::eOptimal,
@@ -624,13 +716,27 @@ void VKTextureCache::import_configure_impl(SceGxmTextureBaseFormat base_format, 
         .initialLayout = vk::ImageLayout::eUndefined,
     };
 
+#ifdef LIBRETRO
+    {
+        const uint32_t seq = ++g_lr_vma_import_seq;
+        vkutil::LibretroVmaCreateImageExtras extras{};
+        extras.fmt = vk_format;
+        extras.base_fmt_hex = static_cast<unsigned>(base_format);
+        extras.raw_gxm_w = log_import_param_w;
+        extras.raw_gxm_h = log_import_param_h;
+        extras.max_dim = max_dim;
+        extras.has_texture_context = true;
+        vkutil::libretro_vma_create_image(state.allocator, image_info, "import", seq, image.image, image.allocation, &extras);
+    }
+#else
     std::tie(image.image, image.allocation) = state.allocator.createImage(image_info, vkutil::vma_auto_alloc);
+#endif
 
     // create image view
     vk::ImageSubresourceRange range{
         .aspectMask = vk::ImageAspectFlagBits::eColor,
         .baseMipLevel = 0,
-        .levelCount = mipcount,
+        .levelCount = mip_levels_vk,
         .baseArrayLayer = 0,
         .layerCount = is_cube ? 6U : 1U
     };

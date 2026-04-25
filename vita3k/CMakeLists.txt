@@ -131,6 +131,14 @@ add_subdirectory(gdbstub)
 add_subdirectory(packages)
 add_subdirectory(vkutil)
 
+if(LIBRETRO)
+	# Libretro build: skip the main `vita3k` executable/bundle entirely.
+	# The libretro core (defined under ../libretro/) links directly against
+	# the subsystem libraries above.
+	message(STATUS "Vita3K: LIBRETRO mode - skipping main executable target")
+	return()
+endif()
+
 if(ANDROID)
 	add_library(vita3k SHARED main.cpp interface.cpp performance.cpp)
 	target_link_libraries(vita3k PRIVATE SDL3::SDL3 android)

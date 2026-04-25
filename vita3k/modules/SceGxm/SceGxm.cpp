@@ -901,6 +901,7 @@ static void display_entry_thread(EmuEnvState &emuenv) {
         return;
     }
 
+    int entries_processed = 0;
     while (true) {
         auto display_callback = display_queue.top();
         if (!display_callback)
@@ -910,9 +911,20 @@ static void display_entry_thread(EmuEnvState &emuenv) {
         SceGxmSyncObject *new_sync = display_callback->new_sync.get(emuenv.mem);
 
         // sceGxmDisplayQueueAddEntry waits for both buffers to complete
+        LOG_INFO("[GXM-DISPLAY] display_entry: entry#{} old_sync_ts_curr={} old_sync_ts_ahead={} need_ts={}",
+                 entries_processed,
+                 old_sync ? old_sync->timestamp_current.load() : 0,
+                 old_sync ? old_sync->timestamp_ahead.load() : 0,
+                 display_callback->old_sync_timestamp);
         renderer::wishlist(old_sync, display_callback->old_sync_timestamp);
-        if (old_sync != new_sync)
+        if (old_sync != new_sync) {
+            LOG_INFO("[GXM-DISPLAY] display_entry: entry#{} new_sync_ts_curr={} new_sync_ts_ahead={} need_ts={}",
+                     entries_processed,
+                     new_sync ? new_sync->timestamp_current.load() : 0,
+                     new_sync ? new_sync->timestamp_ahead.load() : 0,
+                     display_callback->new_sync_timestamp);
             renderer::wishlist(new_sync, display_callback->new_sync_timestamp);
+        }
 
         // now we can remove the thread from the display queue
         display_queue.pop();
@@ -929,6 +941,10 @@ static void display_entry_thread(EmuEnvState &emuenv) {
         renderer::subject_done(old_sync, display_callback->old_sync_timestamp + 1);
         if (old_sync != new_sync)
             renderer::subject_done(new_sync, display_callback->new_sync_timestamp + 1);
+
+        LOG_INFO("[GXM-DISPLAY] display_entry: entry#{} done, q_remaining={}",
+                 entries_processed, display_queue.size());
+        ++entries_processed;
 
         free(emuenv.mem, display_callback->data);
     }
@@ -1690,8 +1706,9 @@ EXPORT(bool, sceGxmColorSurfaceIsEnabled, const SceGxmColorSurface *surface) {
 
 EXPORT(void, sceGxmColorSurfaceSetClip, SceGxmColorSurface *surface, uint32_t xMin, uint32_t yMin, uint32_t xMax, uint32_t yMax) {
     TRACY_FUNC(sceGxmColorSurfaceSetClip, surface, xMin, yMin, xMax, yMax);
-    assert(surface);
-    UNIMPLEMENTED();
+    if (!surface)
+        return;
+    // Vita3K's SceGxmColorSurface does not store clip rects; region clip is handled via GXM/scissor state.
 }
 
 EXPORT(int, sceGxmColorSurfaceSetData, SceGxmColorSurface *surface, Ptr<void> data) {
@@ -2070,6 +2087,9 @@ EXPORT(int, sceGxmDisplayQueueAddEntry, Ptr<SceGxmSyncObject> oldBuffer, Ptr<Sce
     emuenv.gxm.last_display_global = emuenv.gxm.global_timestamp.fetch_add(1, std::memory_order_relaxed);
 
     // function may be blocking here (expected behavior)
+    LOG_INFO("[GXM-QUEUE] DisplayQueueAddEntry: pushing entry old_ts={} new_ts={} q_before={}/{}",
+             display_callback.old_sync_timestamp, display_callback.new_sync_timestamp,
+             emuenv.gxm.display_queue.size(), emuenv.gxm.display_queue.maxPendingCount_);
     emuenv.gxm.display_queue.push(display_callback);
 
     // TODO: I do this because the sync function does not have access to the display state, but this is not great

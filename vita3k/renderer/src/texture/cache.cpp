@@ -27,6 +27,7 @@
 #include <util/log.h>
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 #include <numeric>
 #if defined(__x86_64__) && !defined(__APPLE__)
@@ -281,8 +282,20 @@ uint64_t hash_texture_nostride(const SceGxmTexture &texture, const MemState &mem
 }
 
 uint16_t get_upload_mip(const uint16_t true_mip, const uint16_t width, const uint16_t height) {
-    uint16_t max_mip_text = std::bit_width(std::min(width, height));
-    return std::min(true_mip, max_mip_text);
+#ifdef LIBRETRO
+    // Vulkan (MoltenVK): mipLevels >= 1; width/height 0 => bit_width(0)==0 and vkCreateImage fails.
+    const uint32_t w = std::max<uint32_t>(width, 1);
+    const uint32_t h = std::max<uint32_t>(height, 1);
+    const uint32_t max_mip_text = std::bit_width(std::min(w, h));
+    if (max_mip_text == 0)
+        return 1;
+    const uint32_t capped = std::min<uint32_t>(true_mip, max_mip_text);
+    return static_cast<uint16_t>(std::max(1u, capped));
+#else
+    const uint32_t max_mip_text = std::bit_width(std::min(width, height));
+    const uint32_t capped = std::min<uint32_t>(true_mip, max_mip_text);
+    return static_cast<uint16_t>(capped);
+#endif
 }
 } // namespace texture
 

@@ -23,6 +23,7 @@
 #endif
 
 #include <spdlog/sinks/basic_file_sink.h>
+#include <spdlog/sinks/base_sink.h>
 #include <spdlog/sinks/msvc_sink.h>
 #ifdef __ANDROID__
 #include <spdlog/sinks/android_sink.h>
@@ -33,11 +34,60 @@
 #include <iostream>
 #include <vector>
 
+#if defined(__APPLE__) && defined(LIBRETRO)
+#include <os/log.h>
+#endif
+
 namespace logging {
 
 static const fs::path &LOG_FILE_NAME = "vita3k.log";
 static const char *LOG_PATTERN = "%^[%H:%M:%S.%e] |%L| [%!]: %v%$";
 static std::vector<spdlog::sink_ptr> sinks;
+
+#if defined(__APPLE__) && defined(LIBRETRO)
+// Forward spdlog (including [VITA3K-LR] lines from the engine) into Unified
+// Logging so messages appear in Console.app / log stream alongside os_log
+// from oaknut — stdout/stderr from an embedded core often does not.
+namespace {
+class apple_oslog_sink final : public spdlog::sinks::base_sink<std::mutex> {
+    os_log_t os_log_{};
+
+public:
+    apple_oslog_sink()
+        : os_log_(os_log_create("com.vita3k.libretro", "Core")) {}
+
+protected:
+    void sink_it_(const spdlog::details::log_msg &msg) override {
+        spdlog::memory_buf_t formatted;
+        formatter_->format(msg, formatted);
+        formatted.push_back('\0');
+
+        os_log_type_t type = OS_LOG_TYPE_INFO;
+        switch (msg.level) {
+        case spdlog::level::trace:
+        case spdlog::level::debug:
+            type = OS_LOG_TYPE_DEBUG;
+            break;
+        case spdlog::level::info:
+            type = OS_LOG_TYPE_INFO;
+            break;
+        case spdlog::level::warn:
+            type = OS_LOG_TYPE_DEFAULT;
+            break;
+        case spdlog::level::err:
+        case spdlog::level::critical:
+            type = OS_LOG_TYPE_ERROR;
+            break;
+        default:
+            break;
+        }
+        os_log_with_type(os_log_, type, "%{public}s", formatted.data());
+    }
+
+    void flush_() override {}
+};
+} // namespace
+#endif // __APPLE__ && LIBRETRO
 
 static void register_log_exception_handler();
 
@@ -52,6 +102,10 @@ ExitCode init(const Root &root_paths, bool use_stdout) {
         sinks.push_back(std::make_shared<spdlog::sinks::android_sink_mt>());
 #else
         sinks.push_back(std::make_shared<spdlog::sinks::stdout_color_sink_mt>());
+#endif
+
+#if defined(__APPLE__) && defined(LIBRETRO)
+    sinks.push_back(std::make_shared<apple_oslog_sink>());
 #endif
 
     if (add_sink(root_paths.get_log_path() / LOG_FILE_NAME) != Success)
@@ -70,6 +124,10 @@ ExitCode init(const Root &root_paths, bool use_stdout) {
 
 #ifdef __ANDROID__
     // needed, otherwise the log file contains nothing
+    spdlog::flush_on(spdlog::level::trace);
+#endif
+#if defined(__APPLE__) && defined(LIBRETRO)
+    // Make StikDebug / Console.app sessions useful without Xcode stdout
     spdlog::flush_on(spdlog::level::trace);
 #endif
 

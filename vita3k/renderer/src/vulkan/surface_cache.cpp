@@ -149,11 +149,20 @@ SurfaceRetrieveResult VKSurfaceCache::retrieve_color_surface_for_framebuffer(Mem
     // Create the key to access the cache struct
     const uint32_t address = color->data.address();
 
+#ifdef LIBRETRO
+    const uint32_t max_dim = state.physical_device_properties.limits.maxImageDimension2D;
+    const uint32_t original_width = vkutil::clamp_image_extent_component(color->width, max_dim);
+    const uint32_t original_height = vkutil::clamp_image_extent_component(color->height, max_dim);
+
+    uint32_t width = vkutil::clamp_image_extent_component(static_cast<uint32_t>(original_width * state.res_multiplier), max_dim);
+    uint32_t height = vkutil::clamp_image_extent_component(static_cast<uint32_t>(original_height * state.res_multiplier), max_dim);
+#else
     const uint32_t original_width = color->width;
     const uint32_t original_height = color->height;
 
     uint32_t width = static_cast<uint32_t>(original_width * state.res_multiplier);
     uint32_t height = static_cast<uint32_t>(original_height * state.res_multiplier);
+#endif
 
     bool overlap = true;
 
